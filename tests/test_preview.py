@@ -45,9 +45,9 @@ def _png(tmp_path: Path) -> Path:
 
 def _capture_handler(png: Path, **overrides: Any):
     def handler(args: dict[str, Any]) -> dict[str, Any]:
-        body = {"bSuccess": True, "OutputPath": png.as_posix(), "Width": 1280, "Height": 720, "ErrorMessage": "", "DpiScaleUsed": 1.0, "StateLog": "ok"}
+        body = {"bSuccess": True, "outputPath": png.as_posix(), "width": 1280, "height": 720, "errorMessage": "", "dpiScaleUsed": 1.0, "stateLog": "ok"}
         body.update(overrides)
-        return _structured({"result": body})
+        return _structured({"returnValue": body})
 
     return handler
 
@@ -81,10 +81,13 @@ def test_capture_preview_through_the_hf_bridge(editor: FakeEditor, tmp_path: Pat
     sent = editor.calls("epic_call_tool")
     assert len(sent) == 1
     assert sent[0]["toolset_name"] == "VibeUE.WidgetService"
-    assert sent[0]["tool_name"] == "capture_preview_state"
-    assert sent[0]["arguments"]["widget_path"] == ASSET
+    assert sent[0]["tool_name"] == "CapturePreviewState"
+    assert sent[0]["arguments"]["widgetPath"] == ASSET
     assert (sent[0]["arguments"]["width"], sent[0]["arguments"]["height"]) == (640, 360)
-    assert sent[0]["arguments"]["options"] == {"state": "hovered"}
+    options = sent[0]["arguments"]["options"]
+    assert options["state"] == "hovered"
+    # the live schema marks every options field required
+    assert {"hookFunction", "animationName", "animationTime", "dpiScale", "frames", "deltaTime", "outputName", "applyGenericSetters", "desiredSize"} <= set(options)
     assert "_hf" not in sent[0]
 
 
@@ -114,7 +117,7 @@ def test_two_blank_captures_fail_without_a_third_try(editor: FakeEditor, tmp_pat
 
 
 def test_capture_reporting_failure_is_a_structured_error(editor: FakeEditor, tmp_path: Path) -> None:
-    editor.tools["epic_call_tool"] = _capture_handler(_png(tmp_path), bSuccess=False, OutputPath="", ErrorMessage="Failed to load widget")
+    editor.tools["epic_call_tool"] = _capture_handler(_png(tmp_path), bSuccess=False, outputPath="", errorMessage="Failed to load widget")
 
     result = _live(editor, tmp_path).capture_preview(ASSET)
 
@@ -154,7 +157,7 @@ def test_falls_back_to_the_epic_server_only_when_the_bridge_has_no_epic_tools(
 
     assert result["ok"] is True
     assert result["route"] == "epic-8000"
-    assert epic.calls("call_tool")[0]["tool_name"] == "capture_preview_state"
+    assert epic.calls("call_tool")[0]["tool_name"] == "CapturePreviewState"
     assert editor.calls("epic_call_tool")  # the HF bridge was tried first
 
 
@@ -262,6 +265,18 @@ def test_image_check_command_maps_exit_codes(tmp_path: Path, monkeypatch: pytest
         checked = bridge._run_image_check(png, 123.0)
         assert checked["verdict"] == verdict, code
         assert checked["line"].startswith("OK: ")
+    seen: dict[str, Any] = {}
+    real_run = bridge.subprocess.run
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(bridge.subprocess, "run", spy)
+    bridge._run_image_check(png, 1.0)
+    # the backend's stdin is the MCP stdio pipe: a child that inherits it hung for the full timeout (t320 live run)
+    assert seen["stdin"] is bridge.subprocess.DEVNULL
+    monkeypatch.setattr(bridge.subprocess, "run", real_run)
     monkeypatch.setenv("UESPEC_IMG_CHECK", f"{Path(sys.executable).as_posix()} {script.as_posix()}")
     Path(str(script) + ".code").write_text("0", encoding="utf-8")
     assert bridge._run_image_check(png, 1.0)["verdict"] == "ok"

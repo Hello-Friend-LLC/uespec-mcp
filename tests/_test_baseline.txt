@@ -5,4 +5,4 @@ The event loop scope for asynchronous fixtures will default to the fixture cachi
 ........................................................................ [ 48%]
 ........................................................................ [ 97%]
 ...                                                                      [100%]
-147 passed in 26.74s
+147 passed in 38.27s

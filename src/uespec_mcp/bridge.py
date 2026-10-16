@@ -1090,7 +1090,7 @@ _MONOTONIC = time.monotonic
 NO_AUTH_PLACEHOLDER = "no-auth-token-required"
 DEFAULT_EPIC_URL = "http://127.0.0.1:8000/mcp"
 PREVIEW_TOOLSET = "VibeUE.WidgetService"
-PREVIEW_TOOL = "capture_preview_state"
+PREVIEW_TOOL = "CapturePreviewState"  # registered name (epic_describe_toolset VibeUE.WidgetService); the python action is capture_preview_state
 ROUTE_HF_BRIDGE = "hf-bridge"
 ROUTE_EPIC_SERVER = "epic-8000"
 DEFAULT_PREVIEW_WIDTH = 1280
@@ -1514,11 +1514,23 @@ class LiveEditorBridge:
         tools registered) does it fall back to Epic's own server (``call_tool`` on UESPEC_EPIC_URL, default :8000).
         ``RefreshTools`` is never called (FND-00366).
         """
+        # Live schema (WI-1586 t320): widgetPath/width/height/options, and every options field is `required`.
         inner = {
-            "widget_path": asset_path,
+            "widgetPath": asset_path,
             "width": width,
             "height": height,
-            "options": {"state": state},
+            "options": {
+                "state": state,
+                "hookFunction": "",
+                "animationName": "",
+                "animationTime": 0.0,
+                "dpiScale": 0.0,
+                "frames": 3,
+                "deltaTime": 0.016,
+                "outputName": "",
+                "applyGenericSetters": True,
+                "desiredSize": {"x": 0.0, "y": 0.0},
+            },
         }
         toolset_args = {"toolset_name": PREVIEW_TOOLSET, "tool_name": PREVIEW_TOOL, "arguments": inner}
         hf_reply = self._invoke("epic_call_tool", toolset_args, target=asset_path, mutating=False, send_envelope=False)
@@ -1714,6 +1726,7 @@ def _run_image_check(png: Path, after_epoch: float) -> dict[str, str]:
         completed = subprocess.run(
             [*_img_check_argv(command), "--after", f"{after_epoch:.3f}", str(png)],
             capture_output=True,
+            stdin=subprocess.DEVNULL,  # the backend's own stdin is the MCP stdio pipe: never hand it to a child
             text=True,
             timeout=60,
             check=False,
