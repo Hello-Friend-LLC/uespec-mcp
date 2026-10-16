@@ -9,8 +9,10 @@ import json
 import os
 import platform
 import re
+import shlex
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -202,6 +204,7 @@ def _collect_artifacts(result: dict[str, Any]) -> list[dict[str, str]]:
     add("package-file", result.get("savedPackageFile"))
     add("junit", result.get("outputReport") or result.get("junitPath") or result.get("reportPath"))
     add("failure-report", result.get("failureReportPath"))
+    add("png", result.get("pngPath"))
     return artifacts
 
 
@@ -314,6 +317,7 @@ class BridgeClient:
     """Bridge between Python MCP tools and Unreal commandlets."""
 
     backend_name = "commandlet"
+    preview_unavailable_code: str | None = "PREVIEW_UNAVAILABLE_COMMANDLET"
 
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self.config = config or BridgeConfig.from_env()
@@ -688,6 +692,7 @@ class MockBridge:
     _BINDING_TARGETS = ("content", "visibility")
 
     backend_name = "mock"
+    preview_unavailable_code: str | None = "PREVIEW_UNAVAILABLE_MOCK"
 
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self.config = config or BridgeConfig.from_env()
@@ -1083,6 +1088,13 @@ POLL_INTERVALS_S: tuple[float, ...] = (0.5, 1.0, 1.0, 2.0)
 _SLEEP = time.sleep  # module-level so tests can stub them
 _MONOTONIC = time.monotonic
 NO_AUTH_PLACEHOLDER = "no-auth-token-required"
+DEFAULT_EPIC_URL = "http://127.0.0.1:8000/mcp"
+PREVIEW_TOOLSET = "VibeUE.WidgetService"
+PREVIEW_TOOL = "capture_preview_state"
+ROUTE_HF_BRIDGE = "hf-bridge"
+ROUTE_EPIC_SERVER = "epic-8000"
+DEFAULT_PREVIEW_WIDTH = 1280
+DEFAULT_PREVIEW_HEIGHT = 720
 _TOOL_DONE_STATES = {"completed", "failed"}
 
 
@@ -1220,6 +1232,7 @@ class LiveEditorBridge:
     """
 
     backend_name = "live"
+    preview_unavailable_code: str | None = None
 
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self.config = config or BridgeConfig.from_env()
@@ -1257,8 +1270,8 @@ class LiveEditorBridge:
             raise BridgeConfigurationError(f"{ini_path} sets bRequireAuthToken=True but has no AuthTokens entry.")
         return f"http://127.0.0.1:{port}/mcp", token or NO_AUTH_PLACEHOLDER
 
-    def _open(self) -> _McpHttpClient:
-        url, token = self._endpoint()
+    def _open(self, endpoint: tuple[str, str] | None = None) -> _McpHttpClient:
+        url, token = endpoint or self._endpoint()
         mode = self.config.mode.strip().lower()
         timeout = self.config.live_connect_timeout_s if mode == "auto" else self.config.live_timeout_s
         client = _McpHttpClient(url, token)
@@ -1274,16 +1287,25 @@ class LiveEditorBridge:
 
     # -- one tool call ----------------------------------------------------------------------------
 
-    def _invoke(self, tool: str, arguments: dict[str, Any], *, target: str, mutating: bool) -> dict[str, Any]:
+    def _invoke(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        target: str,
+        mutating: bool,
+        endpoint: tuple[str, str] | None = None,
+        send_envelope: bool = True,
+    ) -> dict[str, Any]:
         correlation_id = current_correlation_id()
         envelope: dict[str, Any] = {"correlationId": correlation_id}
         for key, env_name in (("workId", "UESPEC_WORK_ID"), ("todoId", "UESPEC_TODO_ID")):
             value = os.getenv(env_name)
             if value:
                 envelope[key] = value
-        call_arguments = {**arguments, "_hf": envelope}
+        call_arguments = {**arguments, "_hf": envelope} if send_envelope else dict(arguments)
         deadline = _MONOTONIC() + self.config.live_timeout_s
-        client = self._open()
+        client = self._open(endpoint)
         try:
             reply = client.call_tool(tool, call_arguments, timeout=max(1.0, deadline - _MONOTONIC()))
         except (_McpTimeout, _McpTransportError) as exc:
@@ -1479,6 +1501,229 @@ class LiveEditorBridge:
             "failureReport": self.read_failure_report(resolved_failure) if resolved_failure else {},
         }
         return result
+
+    # -- preview (VibeUE offscreen renderer) ------------------------------------------------------
+
+    def _epic_url(self) -> str:
+        return os.getenv("UESPEC_EPIC_URL") or DEFAULT_EPIC_URL
+
+    def _capture_once(self, asset_path: str, width: int, height: int, state: str) -> tuple[dict[str, Any], str]:
+        """One ``capture_preview_state`` call. Returns (normalized payload, route).
+
+        Route 1 is the HF bridge ``epic_call_tool`` proxy; only when the bridge does not know that tool (0 epic_*
+        tools registered) does it fall back to Epic's own server (``call_tool`` on UESPEC_EPIC_URL, default :8000).
+        ``RefreshTools`` is never called (FND-00366).
+        """
+        inner = {
+            "widget_path": asset_path,
+            "width": width,
+            "height": height,
+            "options": {"state": state},
+        }
+        toolset_args = {"toolset_name": PREVIEW_TOOLSET, "tool_name": PREVIEW_TOOL, "arguments": inner}
+        hf_reply = self._invoke("epic_call_tool", toolset_args, target=asset_path, mutating=False, send_envelope=False)
+        if not _epic_bridge_missing(hf_reply):
+            return hf_reply, ROUTE_HF_BRIDGE
+        try:
+            epic_reply = self._invoke(
+                "call_tool",
+                toolset_args,
+                target=asset_path,
+                mutating=False,
+                endpoint=(self._epic_url(), NO_AUTH_PLACEHOLDER),
+                send_envelope=False,
+            )
+        except BridgeError as exc:
+            first = (hf_reply.get("errors") or [{}])[0].get("message", "epic_call_tool is not registered")
+            unavailable = dict(hf_reply)
+            unavailable["ok"] = False
+            unavailable["code"] = "PREVIEW_ROUTE_UNAVAILABLE"
+            unavailable["errors"] = [
+                structured_error(
+                    "PREVIEW_ROUTE_UNAVAILABLE",
+                    f"HF bridge has no epic_call_tool ({first}) and the Epic server fallback failed: {exc}",
+                    hint="Restart the editor so the bridge re-imports epic_* tools (never call ModelContextProtocol.RefreshTools, FND-00366), or start Epic's MCP server.",
+                )
+            ]
+            return unavailable, ROUTE_EPIC_SERVER
+        return epic_reply, ROUTE_EPIC_SERVER
+
+    @_instrumented("preview")
+    def capture_preview(
+        self,
+        asset_path: str,
+        width: int = DEFAULT_PREVIEW_WIDTH,
+        height: int = DEFAULT_PREVIEW_HEIGHT,
+        state: str = "normal",
+    ) -> dict[str, Any]:
+        """Render a compiled Widget Blueprint offscreen (no PIE) through VibeUE ``capture_preview_state``.
+
+        The first capture after a cold asset load can render blank (FND-01359): a blank image verdict triggers exactly
+        one more capture before the result is a failure. ``UESPEC_IMG_CHECK`` (a command, optionally an ``img_check.py`` path)
+        enables the image verdict; without it ``imageVerdict`` is ``"unchecked"``.
+        """
+        normalized_asset = asset_path.strip()
+        if not normalized_asset.startswith("/"):
+            raise BridgeConfigurationError("preview needs an Unreal asset path such as '/Game/HF/UISpecDemo/WBP_X.WBP_X'.")
+        attempts: list[dict[str, Any]] = []
+        result: dict[str, Any] = {}
+        route = ROUTE_HF_BRIDGE
+        for attempt in (1, 2):
+            started_epoch = time.time() - 1.0
+            reply, route = self._capture_once(normalized_asset, width, height, state)
+            fields = _extract_preview_fields(reply)
+            if reply.get("ok") is False and not fields.get("outputPath"):
+                result = dict(reply)
+                result.setdefault("code", "PREVIEW_FAILED")
+                result.setdefault("errors", [structured_error("PREVIEW_FAILED", str(reply.get("message") or "capture_preview_state failed."))])
+                break
+            if fields.get("success") is False:
+                message = fields.get("errorMessage") or "capture_preview_state reported bSuccess=false."
+                result = {
+                    "ok": False,
+                    "code": "PREVIEW_FAILED",
+                    "errors": [structured_error("PREVIEW_FAILED", str(message), hint="Check the asset path and that the WBP compiled; first-load blanks are retried automatically.")],
+                    "stateLog": fields.get("stateLog"),
+                }
+                break
+            png = self._resolve_preview_png(fields.get("outputPath"), normalized_asset)
+            if png is None:
+                result = {
+                    "ok": False,
+                    "code": "PREVIEW_OUTPUT_MISSING",
+                    "errors": [structured_error("PREVIEW_OUTPUT_MISSING", f"capture_preview_state reported no readable PNG for {normalized_asset} (reported: {fields.get('outputPath')!r}).")],
+                }
+                break
+            check = _run_image_check(png, started_epoch)
+            attempts.append({"attempt": attempt, "pngPath": png.as_posix(), "imageVerdict": check["verdict"], "imageCheck": check["line"]})
+            result = {
+                "ok": check["verdict"] in {"ok", "unchecked"},
+                "assetPath": normalized_asset,
+                "pngPath": png.as_posix(),
+                "width": fields.get("width") or width,
+                "height": fields.get("height") or height,
+                "state": state,
+                "dpiScaleUsed": fields.get("dpiScaleUsed"),
+                "stateLog": fields.get("stateLog"),
+                "imageVerdict": check["verdict"],
+                "imageCheck": check["line"],
+            }
+            if check["verdict"] == "blank" and attempt == 1:
+                continue
+            if not result["ok"]:
+                code = {"blank": "PREVIEW_BLANK", "stale": "PREVIEW_STALE"}.get(check["verdict"], "PREVIEW_IMAGE_INVALID")
+                result["code"] = code
+                result["errors"] = [structured_error(code, f"Image check rejected the capture: {check['line']}")]
+            break
+        result["route"] = route
+        result["blankRetried"] = len(attempts) > 1
+        result["attempts"] = attempts
+        result.setdefault("errors", [])
+        return result
+
+    def _resolve_preview_png(self, reported: Any, asset_path: str) -> Path | None:
+        root = self.config.resolved_project_root()
+        candidates: list[Path] = []
+        if isinstance(reported, str) and reported.strip():
+            raw = Path(reported.strip())
+            candidates.append(raw if raw.is_absolute() or root is None else Path(root) / raw)
+        if root is not None:
+            stem = asset_path.rsplit("/", 1)[-1].split(".", 1)[0]
+            candidates.append(Path(root) / "Saved" / "WidgetPreviews" / f"{stem}.png")
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+
+_IMG_CHECK_VERDICTS = {0: "ok", 41: "blank", 44: "blank", 42: "stale", 40: "missing", 43: "invalid"}
+_PNG_PATH_PATTERN = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|]+?\.png", re.IGNORECASE)
+
+
+def _epic_bridge_missing(reply: dict[str, Any]) -> bool:
+    """True when the HF bridge does not know ``epic_call_tool`` (0 epic_* tools), as opposed to the call itself failing."""
+    if reply.get("ok") is not False:
+        return False
+    if reply.get("code") not in {"MCP_RPC_ERROR", "TOOL_NOT_FOUND", "UNKNOWN_TOOL", "TOOL_ERROR"}:
+        return False
+    text = " ".join(str(entry.get("message", "")) for entry in reply.get("errors") or [] if isinstance(entry, dict))
+    text += " " + str(reply.get("message") or "")
+    return bool(re.search(r"unknown tool|no such tool|tool not found|not registered|epic_call_tool", text, re.IGNORECASE))
+
+
+def _walk_json(value: Any, depth: int = 0) -> Any:
+    """Yield dicts found in a reply, including JSON hidden in string values (Epic call_tool wraps results as text)."""
+    if depth > 6:
+        return
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json(child, depth + 1)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json(child, depth + 1)
+    elif isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return
+        yield from _walk_json(parsed, depth + 1)
+
+
+def _extract_preview_fields(reply: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the FWidgetPreviewResult fields wherever the proxy nested them (PascalCase, snake_case or camelCase)."""
+    aliases = {
+        "success": ("bsuccess", "b_success", "success"),
+        "outputPath": ("outputpath", "output_path", "pngpath"),
+        "width": ("width",),
+        "height": ("height",),
+        "errorMessage": ("errormessage", "error_message"),
+        "dpiScaleUsed": ("dpiscaleused", "dpi_scale_used"),
+        "stateLog": ("statelog", "state_log"),
+    }
+    found: dict[str, Any] = {}
+    for node in _walk_json(reply):
+        lowered = {str(key).lower(): value for key, value in node.items()}
+        for name, keys in aliases.items():
+            if name in found:
+                continue
+            for key in keys:
+                if key in lowered and lowered[key] not in (None, ""):
+                    found[name] = lowered[key]
+                    break
+    if "outputPath" not in found:
+        match = _PNG_PATH_PATTERN.search(json.dumps(reply))
+        if match:
+            found["outputPath"] = match.group(0).replace("\\\\", "/")
+    return found
+
+
+def _img_check_argv(command: str) -> list[str]:
+    stripped = command.strip().strip('"')
+    if stripped.lower().endswith(".py") and Path(stripped).is_file():
+        return [sys.executable, stripped]
+    return shlex.split(command)
+
+
+def _run_image_check(png: Path, after_epoch: float) -> dict[str, str]:
+    """Run ``UESPEC_IMG_CHECK`` (``img_check.py``-compatible: ``--after <epoch> <png>``; exit 41/44 = blank). Optional."""
+    command = os.getenv("UESPEC_IMG_CHECK", "").strip()
+    if not command:
+        return {"verdict": "unchecked", "line": "UESPEC_IMG_CHECK not set"}
+    try:
+        completed = subprocess.run(
+            [*_img_check_argv(command), "--after", f"{after_epoch:.3f}", str(png)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return {"verdict": "unchecked", "line": f"image check could not run: {exc}"}
+    output = (completed.stdout or completed.stderr or "").strip().splitlines()
+    line = output[0] if output else f"exit {completed.returncode}"
+    verdict = _IMG_CHECK_VERDICTS.get(completed.returncode, "unchecked")
+    return {"verdict": verdict, "line": line}
 
 
 _BRIDGE: Any | None = None

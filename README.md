@@ -113,6 +113,7 @@ The orchestrator keeps every patch attempt under `Saved/UESpec/PatchHistory` by 
 - `run_test_spec`
 - `get_failure_report`
 - `list_existing_specs`
+- `preview_spec` (live editor only: compile, then offscreen render through VibeUE `capture_preview_state`; PIE is driven by `ue_driver.py`/HF tools, not the backend; `UESPEC_IMG_CHECK` enables the image verdict, `UESPEC_EPIC_URL` overrides the `:8000` fallback)
 - `set_active_spec`
 - `get_active_spec`
 - `suggest_nearest`

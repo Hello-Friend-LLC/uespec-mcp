@@ -26,14 +26,14 @@ except ImportError:
 
 
 from .tools import compile as compile_tools
-from .tools import context, generate, orchestrator, surface, test as test_tools, validate
+from .tools import context, generate, orchestrator, preview, surface, test as test_tools, validate
 
 FastMCP = _FastMCP
 
 
 def build_server() -> FastMCP:
     mcp = FastMCP("uespec")
-    for module in (surface, validate, compile_tools, test_tools, context, orchestrator, generate):
+    for module in (surface, validate, compile_tools, test_tools, preview, context, orchestrator, generate):
         module.register(mcp)
     _ensure_tools_attribute(mcp)
     return mcp
