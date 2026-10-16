@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
 import os
-from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import Any
 
 from ..bridge import BridgeError, get_bridge, structured_error
+from ..examples import RetrievedExample, retrieve_examples
 from ..llm.base import LLMConfigurationError
 from ..llm.factory import create_llm_client
 from ..llm.prompts.templates import render
@@ -16,6 +18,11 @@ from ..llm.types import LLMImageAttachment, LLMRequest
 from ..orchestrator.core import Orchestrator
 from . import surface, validate
 from ._register import add_tool
+
+try:  # the minimal FastMCP fallback used when fastmcp is not installed has no Context
+    from fastmcp import Context
+except ImportError:  # pragma: no cover
+    Context = Any  # type: ignore[assignment,misc]
 
 
 _SUPPORTED_TARGET_KINDS = {"HUD", "Menu", "Popup", "Modal", "Debug", "WorldSpace", "Component"}
@@ -27,31 +34,37 @@ _SUPPORTED_IMAGE_TYPES = {
     ".gif": "image/gif",
 }
 _DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_SYSTEM_PROMPT = "You convert game UI screenshots into valid UESpec JSON."
+_SAMPLING_SUFFIX = (
+    '\n\nRespond with exactly one JSON object and nothing else: {"spec": <the UESpec document>, "notes": "<short>", '
+    '"confidence": <0..1>}.'
+)
+
+__all__ = ["RetrievedExample", "generate_spec_from_image", "generate_spec_from_image_mcp", "resolve_provider"]
 
 
-@dataclass(frozen=True)
-class RetrievedExample:
-    name: str
-    kind: str
-    path: str
-    snippet: str
-    score: int
+def resolve_provider(provider: str | None) -> str:
+    """The provider name for a call: the explicit argument, else ``UESPEC_LLM_PROVIDER``, else ``none`` (never an implicit vendor)."""
+    value = provider if provider is not None else os.getenv("UESPEC_LLM_PROVIDER", "")
+    return str(value or "").strip().lower() or "none"
 
-    def as_prompt_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "kind": self.kind,
-            "path": self.path,
-            "snippet": self.snippet,
-        }
 
-    def as_result_dict(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "kind": self.kind,
-            "path": self.path,
-            "score": self.score,
-        }
+def _provider_not_configured() -> dict[str, Any]:
+    return _error_result(
+        "PROVIDER_NOT_CONFIGURED",
+        "No LLM provider is configured for generate_spec_from_image.",
+        path="$.provider",
+        hint="Pass provider=claude|openai|mock|sampling or set UESPEC_LLM_PROVIDER. Host Claude sessions should call image_to_spec_context and write the spec themselves.",
+    )
+
+
+def _sampling_unsupported(reason: str) -> dict[str, Any]:
+    return _error_result(
+        "SAMPLING_UNSUPPORTED",
+        reason,
+        path="$.provider",
+        hint="This MCP client did not advertise the sampling capability. Use image_to_spec_context (the host reads the image) or an adapter provider.",
+    )
 
 
 def generate_spec_from_image(
@@ -65,13 +78,132 @@ def generate_spec_from_image(
 ) -> dict[str, Any]:
     normalized_kind = target_kind.strip() or "HUD"
     if normalized_kind not in _SUPPORTED_TARGET_KINDS:
-        return _error_result(
-            "INVALID_TARGET_KIND",
-            f"Unsupported target_kind '{target_kind}'.",
-            path="$.target_kind",
-            hint=f"Use one of: {', '.join(sorted(_SUPPORTED_TARGET_KINDS))}.",
+        return _invalid_kind(target_kind)
+
+    resolved_provider = resolve_provider(provider)
+    if resolved_provider == "none":
+        return _provider_not_configured()
+    if resolved_provider == "sampling":
+        return _sampling_unsupported("MCP sampling needs a live MCP session; a direct (non-MCP) call has none.")
+
+    prepared = _prepare_request(image_path, normalized_kind, visual_prompt, max_examples)
+    if not prepared.get("ok"):
+        return prepared
+
+    response = create_llm_client(resolved_provider).complete(
+        LLMRequest(
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=prepared["prompt"],
+            images=[prepared["attachment"]],
+            expected_output_schema=_generation_response_schema(),
+            max_tokens=5000,
+            temperature=0.1,
+        )
+    )
+    return _finish(prepared, normalized_kind, response.parsed_output, _llm_metadata(response), output_path, visual_prompt, validate_generated)
+
+
+async def generate_spec_from_image_mcp(
+    image_path: str,
+    target_kind: str = "HUD",
+    output_path: str | None = None,
+    visual_prompt: str = "",
+    provider: str | None = None,
+    max_examples: int = 4,
+    validate_generated: bool = True,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """MCP-facing wrapper: adapter providers run as before; ``provider="sampling"`` asks the calling host through MCP sampling."""
+    resolved_provider = resolve_provider(provider)
+    if resolved_provider != "sampling":
+        return await asyncio.to_thread(
+            generate_spec_from_image,
+            image_path,
+            target_kind,
+            output_path,
+            visual_prompt,
+            resolved_provider,
+            max_examples,
+            validate_generated,
         )
 
+    normalized_kind = target_kind.strip() or "HUD"
+    if normalized_kind not in _SUPPORTED_TARGET_KINDS:
+        return _invalid_kind(target_kind)
+    supported, reason = probe_sampling(ctx)
+    if not supported:
+        return _sampling_unsupported(reason)
+
+    prepared = await asyncio.to_thread(_prepare_request, image_path, normalized_kind, visual_prompt, max_examples)
+    if not prepared.get("ok"):
+        return prepared
+
+    from mcp.types import ImageContent, SamplingMessage, TextContent
+
+    attachment: LLMImageAttachment = prepared["attachment"]
+    message = SamplingMessage(
+        role="user",
+        content=[
+            TextContent(type="text", text=prepared["prompt"] + _SAMPLING_SUFFIX),
+            ImageContent(type="image", data=attachment.data_base64, mimeType=attachment.media_type),
+        ],
+    )
+    try:
+        sampled = await ctx.sample([message], system_prompt=_SYSTEM_PROMPT, temperature=0.1, max_tokens=5000)  # type: ignore[union-attr]
+    except Exception as exc:  # noqa: BLE001 - the host may decline or fail; report it, never fabricate a spec
+        return _error_result(
+            "SAMPLING_FAILED",
+            f"The MCP host rejected or failed the sampling request: {type(exc).__name__}: {exc}",
+            path="$.provider",
+            hint="Retry, or use image_to_spec_context and write the spec in the host session.",
+        )
+    parsed = _parse_json_object(getattr(sampled, "text", None) or "")
+    return _finish(
+        prepared,
+        normalized_kind,
+        parsed,
+        {"model": "mcp-sampling", "inputTokens": 0, "outputTokens": 0},
+        output_path,
+        visual_prompt,
+        validate_generated,
+    )
+
+
+def probe_sampling(ctx: Any) -> tuple[bool, str]:
+    """Whether the calling MCP client advertised the ``sampling`` capability (checked per call, never assumed)."""
+    if ctx is None:
+        return False, "No MCP request context is available, so the client's sampling capability cannot be probed."
+    try:
+        from mcp.types import ClientCapabilities, SamplingCapability
+
+        session = ctx.session
+        if session.check_client_capability(ClientCapabilities(sampling=SamplingCapability())):
+            return True, ""
+    except Exception as exc:  # noqa: BLE001 - an unprobeable session counts as unsupported
+        return False, f"The client's sampling capability could not be probed ({type(exc).__name__}: {exc})."
+    return False, "The MCP client did not advertise the sampling capability during initialize."
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    stripped = text.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL)
+    if fence:
+        stripped = fence.group(1).strip()
+    candidates = [stripped]
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if 0 <= start < end:
+        candidates.append(stripped[start : end + 1])
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, dict):
+            return value if "spec" in value else {"spec": value}
+    return None
+
+
+def _prepare_request(image_path: str, normalized_kind: str, visual_prompt: str, max_examples: int) -> dict[str, Any]:
     image_result = _load_image(image_path)
     if not image_result.get("ok"):
         return image_result
@@ -86,19 +218,27 @@ def generate_spec_from_image(
         examples=[example.as_prompt_dict() for example in examples],
         visual_prompt=visual_prompt.strip(),
     )
+    return {
+        "ok": True,
+        "image": image_result,
+        "attachment": image_result["attachment"],
+        "prompt": prompt,
+        "examples": examples,
+        "surface": surface_snapshot,
+    }
 
-    response = create_llm_client(provider).complete(
-        LLMRequest(
-            system_prompt="You convert game UI screenshots into valid UESpec JSON.",
-            user_prompt=prompt,
-            images=[image_result["attachment"]],
-            expected_output_schema=_generation_response_schema(),
-            max_tokens=5000,
-            temperature=0.1,
-        )
-    )
 
-    parsed = response.parsed_output
+def _finish(
+    prepared: dict[str, Any],
+    normalized_kind: str,
+    parsed: Any,
+    llm: dict[str, Any],
+    output_path: str | None,
+    visual_prompt: str,
+    validate_generated: bool,
+) -> dict[str, Any]:
+    image_result = prepared["image"]
+    examples: list[RetrievedExample] = prepared["examples"]
     if not isinstance(parsed, dict) or not isinstance(parsed.get("spec"), dict):
         return {
             "ok": False,
@@ -116,7 +256,7 @@ def generate_spec_from_image(
                     hint="Retry with a model that supports structured output.",
                 )
             ],
-            "llm": _llm_metadata(response),
+            "llm": llm,
         }
 
     spec = parsed["spec"]
@@ -145,10 +285,19 @@ def generate_spec_from_image(
         "outputPath": str(resolved_output_path) if resolved_output_path else None,
         "validation": validation,
         "retrievedExamples": [example.as_result_dict() for example in examples],
-        "supportSurfaceVersion": _surface_version(surface_snapshot),
-        "llm": _llm_metadata(response),
+        "supportSurfaceVersion": _surface_version(prepared["surface"]),
+        "llm": llm,
         "errors": validation.get("errors", []),
     }
+
+
+def _invalid_kind(target_kind: str) -> dict[str, Any]:
+    return _error_result(
+        "INVALID_TARGET_KIND",
+        f"Unsupported target_kind '{target_kind}'.",
+        path="$.target_kind",
+        hint=f"Use one of: {', '.join(sorted(_SUPPORTED_TARGET_KINDS))}.",
+    )
 
 
 def generate_spec_from_image_with_autofix(
@@ -215,7 +364,7 @@ def generate_spec_from_image_with_autofix(
     try:
         orchestrator = Orchestrator(
             get_bridge(),
-            create_llm_client(provider),
+            create_llm_client(resolve_provider(provider)),
             max_attempts=max_attempts,
             history_dir=resolved_history_dir,
         )
@@ -246,6 +395,11 @@ def generate_spec_from_image_with_autofix(
         "autofix": autofix_result,
         "errors": autofix_result.get("errors", []) if not autofix_result.get("ok") else [],
     }
+
+
+def load_image(image_path: str) -> dict[str, Any]:
+    """Validate and read an image file (type and size limits); ``ok`` replies carry ``path``, ``attachment`` and ``sizeBytes``."""
+    return _load_image(image_path)
 
 
 def _load_image(image_path: str) -> dict[str, Any]:
@@ -321,72 +475,9 @@ def _extract_surface_names(snapshot: dict[str, Any], keys: list[str], name_key: 
 
 
 def _retrieve_examples(target_kind: str, snapshot: dict[str, Any], *, max_examples: int) -> list[RetrievedExample]:
-    examples: list[RetrievedExample] = []
     component_names = set(_extract_surface_names(snapshot, ["RegisteredComponents"], "Type"))
-    for root in _examples_roots():
-        if not root.is_dir():
-            continue
-        for path in root.rglob("*.json"):
-            parsed = _read_json_file(path)
-            if not isinstance(parsed, dict) or not isinstance(parsed.get("root"), dict):
-                continue
-            kind = str(parsed.get("kind", ""))
-            name = str(parsed.get("name", path.stem))
-            text = json.dumps(parsed, ensure_ascii=False, indent=2)
-            score = 0
-            if kind == target_kind:
-                score += 50
-            if path.parts and "HUDs" in path.parts:
-                score += 20
-            score += min(25, sum(1 for component in component_names if f'"type": "{component}"' in text))
-            examples.append(
-                RetrievedExample(
-                    name=name,
-                    kind=kind,
-                    path=str(path),
-                    snippet=_truncate_text(text, 3500),
-                    score=score,
-                )
-            )
-    examples.sort(key=lambda example: (-example.score, example.name.lower()))
-    return examples[: max(0, max_examples)]
-
-
-def _examples_roots() -> list[Path]:
-    roots: list[Path] = []
-    env_root = os.getenv("UESPEC_EXAMPLES_ROOT")
-    if env_root:
-        return [Path(env_root).expanduser()]
-    repo_hint = os.getenv("UESPEC_REPO_ROOT")
-    if repo_hint:
-        roots.append(Path(repo_hint).expanduser() / "Examples")
-    package_path = Path(__file__).resolve()
-    roots.append(package_path.parents[3].parent / "uespec" / "Examples")
-    roots.append(Path.cwd() / "Examples")
-    deduped: list[Path] = []
-    seen: set[str] = set()
-    for root in roots:
-        try:
-            key = str(root.resolve())
-        except OSError:
-            key = str(root)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(root)
-    return deduped
-
-
-def _read_json_file(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-
-
-def _truncate_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 20].rstrip() + "\n  ...\n}"
+    examples, _where = retrieve_examples(target_kind, component_names, max_examples=max_examples)
+    return examples
 
 
 def _generation_response_schema() -> dict[str, Any]:
@@ -449,8 +540,8 @@ def register(mcp: Any) -> None:
     add_tool(
         mcp,
         "generate_spec_from_image",
-        "Generate a UISpec JSON document from a UI screenshot (LLM adapter; uses the cached support surface and example retrieval).",
-        generate_spec_from_image,
+        "Explicit LLM path: UISpec from a screenshot via provider claude|openai|mock or MCP sampling (host must advertise it, else SAMPLING_UNSUPPORTED). Default none -> PROVIDER_NOT_CONFIGURED. Host Claude: use image_to_spec_context.",
+        generate_spec_from_image_mcp,
     )
     add_tool(
         mcp,

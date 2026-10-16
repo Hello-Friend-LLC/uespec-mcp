@@ -8,9 +8,9 @@ from . import _envelope, context
 from ._register import add_tool
 
 PREVIEW_DESCRIPTION = (
-    "Compile UISpec JSON file(s) in the live editor and render each offscreen (no PIE) through VibeUE capture_preview_state; "
-    "returns the absolute PNG path in artifacts[] plus an image verdict. spec_path is a path or an array; "
-    "pass asset_path instead to preview an existing asset without compiling. PIE is NOT driven by this backend."
+    "Compile spec_path (path or array) in the live editor and render offscreen via VibeUE capture_preview_state; "
+    "returns the absolute PNG path in artifacts[] plus an image verdict. asset_path previews an existing asset without compiling. "
+    "PIE is NOT driven by this backend."
 )
 
 

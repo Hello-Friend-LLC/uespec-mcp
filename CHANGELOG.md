@@ -5,6 +5,13 @@ versioned public release yet, so entries are grouped by development round.
 
 ## Unreleased - prerelease cleanup
 
+- HF (WI-1586 t510): `image_to_spec_context` returns everything a host Claude session needs to write a UESpec from a
+  screenshot except the pixels (it reads the PNG): component catalog and schema digests from the cached surface, a skeleton
+  for the parent class, supported events/primitives/converters and the nearest examples. The examples directory is now a
+  config path (`examples_dir`: `UESPEC_EXAMPLES_DIR` / `examplesDir`, default the plugin's `Examples/`). `generate_spec_from_image`
+  defaults to provider `none` (`PROVIDER_NOT_CONFIGURED`) and gains `provider=sampling`, probing the client's MCP sampling
+  capability per call (`SAMPLING_UNSUPPORTED` when absent).
+
 - HF (WI-1586 t500): default repair flow driven by the host Claude session. `get_failure_report` returns structured
   failures (code, JSON pointer, nearest names, candidate patch) for a spec or test spec; `apply_spec_patch` records
   `PatchHistory/<spec-stem>/<n>.json` before touching the spec and enforces an attempt limit

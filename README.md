@@ -124,10 +124,11 @@ and absolute paths for files. Replies from the artifact-returning tools stay und
   `apply_spec_patch` (RFC 6902 `patch`, `note`; writes `<n>.json` {before, after, patch, note, ts} before touching the spec, then validates; `REPAIR_LIMIT_REACHED` after `maxAttempts` failing attempts, default 3, `UESPEC_MAX_ATTEMPTS` or project `maxAttempts`; test specs reject assertion removal or lowered expected counts with `ASSERTION_REMOVAL_REJECTED` unless `allow_assertion_change` and `reason`),
   `rollback_spec` (`to` = attempt number, 0 = original; recompiles the asset in place when it was built from a later state and compares the asset hash),
   `repair_status` (`reset=true` starts a new repair session)
+- `image_to_spec_context` (`image_path`, `hints`, `target_kind`, `parent_class`): screenshot-to-spec for the host session, which reads the PNG itself. Returns the image path/metadata, `catalogDigest` (widget groups, converters, style tokens, signals), `schemaDigest`, a `skeleton` spec for the parent class, `constraints` (supported/unsupported action events and primitives per the surface statuses, converters, rules) and the nearest example specs. Served from the surface cache; with no cache and no editor the surface-derived parts say `available: false` with the bridge error code, nothing is invented
 - `list_existing_specs`
 - `preview_spec` (live editor only: compile, then offscreen render through VibeUE `capture_preview_state`; PIE is driven by `ue_driver.py`/HF tools, not the backend; `UESPEC_IMG_CHECK` enables the image verdict, `UESPEC_EPIC_URL` overrides the `:8000` fallback; a blank first capture is retried once)
 - `suggest_nearest`
-- LLM-adapter tools, registered only when a provider is configured (`UESPEC_LLM_PROVIDER`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`; force with `UESPEC_LLM_TOOLS=on|off`): `propose_patch_from_failure`, `autofix_spec` (`provider` claude|openai|mock, default none -> `PROVIDER_NOT_CONFIGURED`), `generate_spec_from_image`, `generate_spec_from_image_with_autofix`
+- LLM-adapter tools, registered only when a provider is configured (`UESPEC_LLM_PROVIDER`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`; force with `UESPEC_LLM_TOOLS=on|off`): `propose_patch_from_failure`, `autofix_spec` (`provider` claude|openai|mock, default none -> `PROVIDER_NOT_CONFIGURED`), `generate_spec_from_image` (`provider` claude|openai|mock|sampling, default none -> `PROVIDER_NOT_CONFIGURED`; `sampling` probes the MCP client's `sampling` capability on every call and returns `SAMPLING_UNSUPPORTED` when it was not advertised), `generate_spec_from_image_with_autofix`
 
 ## Environment
 
@@ -162,8 +163,7 @@ Relay deployments do not always expose the default Claude model alias. If `/v1/m
 Screenshot generation settings:
 
 - `UESPEC_MAX_IMAGE_BYTES`: defaults to 8 MiB.
-- `UESPEC_EXAMPLES_ROOT`: optional examples directory override for retrieval.
-- `UESPEC_REPO_ROOT`: optional UESpec plugin repo root used to find `Examples/`.
+- `UESPEC_EXAMPLES_DIR` (alias `UESPEC_EXAMPLES_ROOT`) or `examplesDir` in `<project>/UESpec/uespec.hf.json`: examples directory for retrieval. Default: `Examples/` of the UESpec plugin resolved from the engine/project identity. Last resort only: `UESPEC_REPO_ROOT/Examples`, the sibling `uespec` checkout, `./Examples` (reported as `legacy-fallback`).
 
 ## Commandlet Interface
 

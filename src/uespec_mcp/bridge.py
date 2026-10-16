@@ -123,6 +123,7 @@ class BridgeConfig(BaseModel):
     live_connect_timeout_s: float = LIVE_CONNECT_TIMEOUT_S
     live_url: str | None = None
     live_token: str | None = None
+    examples_dir: Path | None = None
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -155,7 +156,14 @@ class BridgeConfig(BaseModel):
         timeout_env = os.getenv("UESPEC_LIVE_TIMEOUT_S")
         timeout_value = timeout_env or file_config.get("liveTimeoutSeconds")
         allow_env = os.getenv("UESPEC_ALLOW_LIVE_EDITOR")
+        examples_value = os.getenv("UESPEC_EXAMPLES_DIR") or os.getenv("UESPEC_EXAMPLES_ROOT") or file_config.get("examplesDir")
+        examples_dir: Path | None = None
+        if examples_value:
+            examples_dir = Path(str(examples_value)).expanduser()
+            if not examples_dir.is_absolute() and project_root is not None:
+                examples_dir = project_root / examples_dir
         return cls(
+            examples_dir=examples_dir,
             uproject_path=uproject_path,
             ue_engine_path=Path(str(engine_path)).expanduser() if engine_path else None,
             mode=raw_mode,

@@ -109,7 +109,7 @@ def test_generate_spec_from_image_uses_surface_examples_and_image(tmp_path: Path
     fake_client = FakeLLMClient()
     monkeypatch.setattr(generate, "create_llm_client", lambda provider=None: fake_client)
 
-    result = generate.generate_spec_from_image(str(image_path), target_kind="HUD", visual_prompt="health HUD")
+    result = generate.generate_spec_from_image(str(image_path), target_kind="HUD", visual_prompt="health HUD", provider="mock")
 
     assert result["ok"] is True
     assert result["generatedSpec"]["name"] == "GeneratedHud"
@@ -150,6 +150,7 @@ def test_generate_spec_from_image_with_autofix_runs_orchestrator(tmp_path: Path,
         str(test_spec_path),
         output_path=str(output_path),
         history_dir=str(tmp_path / "PatchHistory"),
+        provider="mock",
     )
 
     assert result["ok"] is True
@@ -175,6 +176,7 @@ def test_generate_spec_from_image_with_autofix_rejects_missing_test_spec(tmp_pat
         str(image_path),
         str(tmp_path / "missing-test.json"),
         output_path=str(output_path),
+        provider="mock",
     )
 
     assert result["ok"] is False
@@ -184,7 +186,7 @@ def test_generate_spec_from_image_with_autofix_rejects_missing_test_spec(tmp_pat
 
 
 def test_generate_spec_from_image_rejects_missing_image() -> None:
-    result = generate.generate_spec_from_image("missing.png")
+    result = generate.generate_spec_from_image("missing.png", provider="mock")
 
     assert result["ok"] is False
     assert result["errors"][0]["code"] == "IMAGE_NOT_FOUND"

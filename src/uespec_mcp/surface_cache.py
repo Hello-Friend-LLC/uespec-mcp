@@ -135,6 +135,12 @@ def _find_plugin_dir(name: str, engine_root: Path | None, project_root: Path | N
     return None
 
 
+def find_plugin_dir(name: str, config: Any) -> Path | None:
+    """Plugin directory (engine fork ``HF_Plugins``/``Plugins``, then the project's ``Plugins``) for the config's engine and project."""
+    project_root = config.resolved_project_root() if hasattr(config, "resolved_project_root") else None
+    return _find_plugin_dir(name, resolve_engine_root(config), project_root)
+
+
 def _git_dir(plugin_dir: Path) -> Path | None:
     dot_git = plugin_dir / ".git"
     try:
