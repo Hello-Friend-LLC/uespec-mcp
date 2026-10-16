@@ -33,6 +33,7 @@ def validate_spec(spec_content: str) -> dict[str, Any]:
         }
 
     validator = _get_validator()
+    warnings = collect_unsupported_key_warnings(parsed, _load_schema())
     schema_errors = sorted(validator.iter_errors(parsed), key=lambda error: _jsonschema_path(error))
     if schema_errors:
         return {
@@ -40,6 +41,7 @@ def validate_spec(spec_content: str) -> dict[str, Any]:
             "stage": "schema",
             "normalizedJson": None,
             "errors": [_schema_error_to_structured_error(error) for error in schema_errors],
+            "warnings": warnings,
             "semanticValidation": {"status": "skipped", "reason": "Schema validation failed."},
         }
 
@@ -52,10 +54,12 @@ def validate_spec(spec_content: str) -> dict[str, Any]:
             "stage": "schema",
             "normalizedJson": normalized_json,
             "errors": [],
+            "warnings": warnings,
             "semanticValidation": {"status": "skipped", "reason": str(exc)},
         }
 
     semantic["stage"] = "semantic"
+    semantic["warnings"] = warnings
     semantic.setdefault("semanticValidation", {"status": "completed"})
     if semantic.get("normalizedJson") is None:
         semantic["normalizedJson"] = normalized_json
@@ -106,12 +110,89 @@ def _schema_error_to_structured_error(error: Any) -> dict[str, Any]:
     elif error.validator == "type":
         hint = f"Expected type: {error.validator_value}."
 
+    bind_error = _find_bind_pattern_error(error)
+    if bind_error is not None:
+        # Same code and path shape the UE compiler uses for a bind it cannot generate (UESpecBindingBuilder).
+        return structured_error(
+            "UNSUPPORTED_BINDING_PATH",
+            f"Bind path '{bind_error.instance}' uses an index or call expression ([ ] ( )), which bindings do not support.",
+            path=_jsonschema_path(bind_error),
+            hint="Bind a flat ViewModel field (for example expose the indexed value as its own field on the ViewModel).",
+        )
+
     return structured_error(
         "SCHEMA_VALIDATION_FAILED",
         error.message,
         path=_jsonschema_path(error),
         hint=hint,
     )
+
+
+def _find_bind_pattern_error(error: Any) -> Any | None:
+    """The bind-path pattern failure, whether reported directly or buried in a oneOf branch (widget content/visibility)."""
+    if error.validator == "pattern" and _jsonschema_path(error).endswith(".bind"):
+        return error
+    for sub_error in error.context or []:
+        found = _find_bind_pattern_error(sub_error)
+        if found is not None:
+            return found
+    return None
+
+
+def collect_unsupported_key_warnings(instance: Any, schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """Warn for every key the schema marks ``"x-status": "unsupported"`` (accepted by the schema, consumed by nothing)."""
+    warnings: list[dict[str, Any]] = []
+    _walk_unsupported(instance, schema, schema, "$", warnings)
+    return warnings
+
+
+def _resolve_ref(subschema: Any, root: dict[str, Any]) -> Any:
+    while isinstance(subschema, dict) and isinstance(subschema.get("$ref"), str):
+        node: Any = root
+        for part in subschema["$ref"].removeprefix("#/").split("/"):
+            node = node[part]
+        subschema = node
+    return subschema
+
+
+def _instance_matches_type(instance: Any, subschema: dict[str, Any]) -> bool:
+    expected = subschema.get("type")
+    if expected == "object":
+        return isinstance(instance, dict)
+    if expected == "array":
+        return isinstance(instance, list)
+    return expected is None
+
+
+def _walk_unsupported(instance: Any, subschema: Any, root: dict[str, Any], path: str, warnings: list[dict[str, Any]]) -> None:
+    subschema = _resolve_ref(subschema, root)
+    if not isinstance(subschema, dict):
+        return
+    for branch in subschema.get("oneOf", []):
+        resolved = _resolve_ref(branch, root)
+        if isinstance(resolved, dict) and resolved.get("type") is not None and _instance_matches_type(instance, resolved):
+            _walk_unsupported(instance, resolved, root, path, warnings)
+
+    if isinstance(instance, dict):
+        properties = subschema.get("properties", {})
+        for key, value in instance.items():
+            child_schema = _resolve_ref(properties.get(key), root)
+            if not isinstance(child_schema, dict):
+                continue
+            child_path = f"{path}.{key}"
+            if child_schema.get("x-status") == "unsupported":
+                warnings.append(
+                    structured_error(
+                        "UNSUPPORTED_KEY",
+                        f"Key '{key}' is accepted by the schema but has no consumer: it is ignored on compile.",
+                        path=child_path,
+                        hint="Remove the key, or do not rely on it.",
+                    )
+                )
+            _walk_unsupported(value, child_schema, root, child_path, warnings)
+    elif isinstance(instance, list) and isinstance(subschema.get("items"), (dict,)):
+        for index, item in enumerate(instance):
+            _walk_unsupported(item, subschema["items"], root, f"{path}[{index}]", warnings)
 
 
 def register(mcp: Any) -> None:

@@ -354,7 +354,12 @@ class BridgeClient:
 
 
 class MockBridge:
-    """Offline bridge for eval smoke runs when Unreal is unavailable."""
+    """Offline bridge for eval smoke runs when Unreal is unavailable.
+
+    The registered surface mirrors the UESpec plugin (hf-5-8, WI-1586 t210): the component, converter,
+    signal and action lists below are the plugin's, not invented. Error codes are a subset of the
+    plugin's; the mock cannot emit codes that need a live Unreal type system (INVALID_CONVERTER).
+    """
 
     _WIDGET_TYPES = {
         "Border",
@@ -368,11 +373,11 @@ class MockBridge:
         "Image",
         "ItemSlot",
         "ItemTooltip",
-        "MinimapMarker",
         "Overlay",
         "PlayerNamePlate",
         "ProgressBar",
         "QuestEntry",
+        "RedDot",
         "ResourceBar",
         "SizeBox",
         "SkillSlot",
@@ -380,8 +385,54 @@ class MockBridge:
         "TextBlock",
         "VerticalBox",
     }
-    _CONVERTERS = {"BoolToVisibility", "Percent", "SecondsToCooldownText"}
-    _SIGNALS = {"onSkillUsed", "onCooldownStarted", "onQuestUpdated", "onInventoryChanged"}
+    _CONVERTERS = {"BoolToVisibility", "LocText", "Negate", "Percent", "RarityColor", "Stringify", "TimeFormat"}
+    _SIGNALS = {
+        "onChatMessageReceived",
+        "onDamageNumberSpawned",
+        "onHealthChanged",
+        "onItemEquipped",
+        "onItemHovered",
+        "onQuestTracked",
+        "onResourceChanged",
+        "onSkillUsed",
+        "onStatusEffectAdded",
+        "onTargetChanged",
+        "onTooltipShown",
+    }
+    # (name, status) pairs as the plugin's GetActionEventSurface / GetActionPrimitiveSurface report them.
+    _ACTION_EVENTS = (
+        ("Clicked", "supported"),
+        ("Pressed", "supported"),
+        ("Released", "supported"),
+        ("Hovered", "supported"),
+        ("Unhovered", "supported"),
+        ("FocusReceived", "unimplemented"),
+        ("FocusLost", "unimplemented"),
+        ("DoubleClicked", "unimplemented"),
+        ("LongPressed", "unimplemented"),
+        ("DragDetected", "unimplemented"),
+        ("Drop", "unimplemented"),
+    )
+    _ACTION_PRIMITIVES = (
+        ("openLayer", "supported"),
+        ("closeLayer", "supported"),
+        ("setState", "supported"),
+        ("callVM", "supported"),
+        ("emitSignal", "supported"),
+        ("playAnim", "unimplemented"),
+    )
+    # Widgets with no text or percent destination: a `content` bind on them is UNSUPPORTED_BINDING_TARGET.
+    _NON_CONTENT_BINDABLE = {
+        "Border",
+        "Button",
+        "CanvasPanel",
+        "HorizontalBox",
+        "Image",
+        "Overlay",
+        "SizeBox",
+        "VerticalBox",
+    }
+    _BINDING_TARGETS = ("content", "visibility")
 
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self.config = config or BridgeConfig.from_env()
@@ -404,6 +455,13 @@ class MockBridge:
             "",
             "## Signals",
             ", ".join(sorted(self._SIGNALS)),
+            "",
+            "## Actions",
+            "### Events",
+            *[_format_action_entry(name, status) for name, status in self._ACTION_EVENTS],
+            "",
+            "### Primitives",
+            *[_format_action_entry(name, status) for name, status in self._ACTION_PRIMITIVES],
         ]
         return {"ok": True, "format": "markdown", "content": "\n".join(lines), "command": ["mock"]}
 
@@ -418,11 +476,12 @@ class MockBridge:
                 "errors": [structured_error("INVALID_JSON", exc.msg, path=f"$[{exc.lineno}:{exc.colno}]")],
                 "semanticValidation": {"status": "mock"},
             }
+        errors = self._collect_action_errors(parsed)
         return {
-            "ok": True,
+            "ok": not errors,
             "stage": "semantic",
             "normalizedJson": json.dumps(parsed, ensure_ascii=False, indent=2, sort_keys=True),
-            "errors": [],
+            "errors": errors,
             "semanticValidation": {"status": "mock"},
         }
 
@@ -498,41 +557,137 @@ class MockBridge:
             "Converters": [{"Name": name} for name in sorted(self._CONVERTERS)],
             "StyleTokens": [],
             "Signals": [{"Name": name} for name in sorted(self._SIGNALS)],
+            "ActionEvents": [{"Name": name, "Status": status} for name, status in self._ACTION_EVENTS],
+            "ActionPrimitives": [{"Name": name, "Status": status} for name, status in self._ACTION_PRIMITIVES],
         }
 
-    def _collect_compile_errors(self, document: dict[str, Any]) -> list[dict[str, Any]]:
+    def _collect_action_errors(self, document: Any) -> list[dict[str, Any]]:
+        """Validation-stage errors: unimplemented action events and primitives (plugin: ValidateActions)."""
         errors: list[dict[str, Any]] = []
+        root = document.get("root") if isinstance(document, dict) else None
+        if isinstance(root, dict):
+            self._collect_widget_action_errors(root, "$.root", errors)
+        return errors
+
+    def _collect_widget_action_errors(self, widget: dict[str, Any], path: str, errors: list[dict[str, Any]]) -> None:
+        unimplemented_events = {name for name, status in self._ACTION_EVENTS if status != "supported"}
+        unimplemented_primitives = {name for name, status in self._ACTION_PRIMITIVES if status != "supported"}
+        supported_events = [name for name, status in self._ACTION_EVENTS if status == "supported"]
+        supported_primitives = [name for name, status in self._ACTION_PRIMITIVES if status == "supported"]
+
+        actions = widget.get("actions", [])
+        for action_index, action in enumerate(actions if isinstance(actions, list) else []):
+            if not isinstance(action, dict):
+                continue
+            action_path = f"{path}.actions[{action_index}]"
+            event = action.get("on")
+            if isinstance(event, str) and event in unimplemented_events:
+                errors.append(
+                    structured_error(
+                        "UNSUPPORTED_EVENT",
+                        f"Action event '{event}' is declared in the schema but not implemented by the compiler.",
+                        path=f"{action_path}.on",
+                        hint=f"Use {', '.join(supported_events)}.",
+                        nearest_declared=supported_events,
+                    )
+                )
+            action_block = action.get("do")
+            if isinstance(action_block, dict):
+                for primitive in action_block:
+                    if primitive in unimplemented_primitives:
+                        errors.append(
+                            structured_error(
+                                "UNSUPPORTED_ACTION",
+                                f"Action primitive '{primitive}' is declared in the schema but not implemented by the compiler.",
+                                path=f"{action_path}.do.{primitive}",
+                                hint=f"Use {', '.join(supported_primitives)}.",
+                                nearest_declared=supported_primitives,
+                            )
+                        )
+
+        children = widget.get("children", [])
+        for index, child in enumerate(children if isinstance(children, list) else []):
+            if isinstance(child, dict):
+                self._collect_widget_action_errors(child, f"{path}.children[{index}]", errors)
+
+    def _collect_compile_errors(self, document: dict[str, Any]) -> list[dict[str, Any]]:
+        errors: list[dict[str, Any]] = self._collect_action_errors(document)
         view_model = document.get("viewModel") if isinstance(document, dict) else None
         declared_methods = {
             str(method.get("name"))
             for method in (view_model.get("methods", []) if isinstance(view_model, dict) else [])
             if isinstance(method, dict) and method.get("name")
         }
+        declared_fields = {
+            str(field.get("name"))
+            for field in (view_model.get("fields", []) if isinstance(view_model, dict) else [])
+            if isinstance(field, dict) and field.get("name")
+        }
         root = document.get("root") if isinstance(document, dict) else None
         if isinstance(root, dict):
-            self._collect_widget_errors(root, "$.root", declared_methods, errors)
-
-        state_machine = document.get("stateMachine") if isinstance(document, dict) else None
-        states = state_machine.get("states", []) if isinstance(state_machine, dict) else []
-        if isinstance(states, list):
-            for state_index, state in enumerate(states):
-                transitions = state.get("transitions", []) if isinstance(state, dict) else []
-                if not isinstance(transitions, list):
-                    continue
-                for transition_index, transition in enumerate(transitions):
-                    if not isinstance(transition, dict):
-                        continue
-                    signal = str(transition.get("when") or "")
-                    if signal and signal not in self._SIGNALS:
-                        errors.append(
-                            structured_error(
-                                "UNKNOWN_SIGNAL",
-                                f"Signal '{signal}' is not registered.",
-                                path=f"$.stateMachine.states[{state_index}].transitions[{transition_index}].when",
-                                nearest_declared=get_close_matches(signal, sorted(self._SIGNALS), n=3),
-                            )
-                        )
+            self._collect_widget_errors(root, "$.root", declared_methods, errors, declared_fields)
         return errors
+
+    def _collect_binding_errors(
+        self,
+        widget: dict[str, Any],
+        path: str,
+        declared_members: set[str],
+        errors: list[dict[str, Any]],
+    ) -> None:
+        """Compile-stage binding errors (plugin: UESpecBindingBuilder). Only `content` and `visibility` are bound."""
+        widget_type = str(widget.get("type") or "")
+        for target in self._BINDING_TARGETS:
+            expression = widget.get(target)
+            if not isinstance(expression, dict) or not isinstance(expression.get("bind"), str):
+                continue
+            target_path = f"{path}.{target}"
+            bind_path = expression["bind"]
+
+            if target == "content" and widget_type in self._NON_CONTENT_BINDABLE:
+                errors.append(
+                    structured_error(
+                        "UNSUPPORTED_BINDING_TARGET",
+                        f"Widget '{widget.get('id')}' has no bindable destination for '{bind_path}'.",
+                        path=target_path,
+                        hint="Bind content only on a TextBlock (Text) or ProgressBar (Percent); visibility binds on any widget.",
+                    )
+                )
+
+            if any(char in bind_path for char in "[]()"):
+                errors.append(
+                    structured_error(
+                        "UNSUPPORTED_BINDING_PATH",
+                        f"Bind path '{bind_path}' uses an index or call expression ([ ] ( )), which bindings do not support.",
+                        path=f"{target_path}.bind",
+                        hint="Bind a flat ViewModel field (for example expose the indexed value as its own field on the ViewModel).",
+                    )
+                )
+                continue
+
+            # An undeclared ViewModel cannot be checked; with fields declared, the first segment must resolve.
+            head = bind_path.removeprefix("vm.").split(".", 1)[0]
+            if declared_members and head not in declared_members:
+                errors.append(
+                    structured_error(
+                        "UNRESOLVED_BINDING_PATH",
+                        f"Bind path '{bind_path}' does not resolve to a property of the ViewModel.",
+                        path=f"{target_path}.bind",
+                        hint="Check the field name and casing against the viewModel fields.",
+                        nearest_declared=get_close_matches(head, sorted(declared_members), n=3),
+                    )
+                )
+
+            converter = expression.get("convert")
+            if converter and str(converter) not in self._CONVERTERS:
+                errors.append(
+                    structured_error(
+                        "UNKNOWN_CONVERTER",
+                        f"Converter '{converter}' is not registered.",
+                        path=f"{target_path}.convert",
+                        nearest_declared=get_close_matches(str(converter), sorted(self._CONVERTERS), n=3),
+                    )
+                )
 
     def _collect_widget_errors(
         self,
@@ -540,6 +695,7 @@ class MockBridge:
         path: str,
         declared_methods: set[str],
         errors: list[dict[str, Any]],
+        declared_fields: set[str] | None = None,
     ) -> None:
         widget_type = str(widget.get("type") or "")
         if widget_type and widget_type not in self._WIDGET_TYPES:
@@ -552,17 +708,7 @@ class MockBridge:
                 )
             )
 
-        visibility = widget.get("visibility")
-        converter = visibility.get("convert") if isinstance(visibility, dict) else None
-        if converter and str(converter) not in self._CONVERTERS:
-            errors.append(
-                structured_error(
-                    "UNKNOWN_CONVERTER",
-                    f"Converter '{converter}' is not registered.",
-                    path=f"{path}.visibility.convert",
-                    nearest_declared=get_close_matches(str(converter), sorted(self._CONVERTERS), n=3),
-                )
-            )
+        self._collect_binding_errors(widget, path, (declared_fields | declared_methods) if declared_fields else set(), errors)
 
         actions = widget.get("actions", [])
         if isinstance(actions, list):
@@ -585,7 +731,7 @@ class MockBridge:
         if isinstance(children, list):
             for index, child in enumerate(children):
                 if isinstance(child, dict):
-                    self._collect_widget_errors(child, f"{path}.children[{index}]", declared_methods, errors)
+                    self._collect_widget_errors(child, f"{path}.children[{index}]", declared_methods, errors, declared_fields)
 
     def _compile_result(
         self,
@@ -611,6 +757,11 @@ class MockBridge:
             "specPath": str(spec_file),
             "outputDir": normalized_output_dir,
         }
+
+
+def _format_action_entry(name: str, status: str) -> str:
+    # Same shape as the plugin's markdown dumper: unimplemented entries carry their status.
+    return f"- {name}" if status == "supported" else f"- {name} ({status})"
 
 
 def _extract_vm_method_name(expression: str) -> str | None:

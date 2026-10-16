@@ -193,7 +193,9 @@ The manifest is in `evals/screenshot_cases/manifest.json`. PNGs are not bundled;
 
 - `socket` bridge mode is not implemented.
 - `mock` bridge mode is designed for offline eval confidence, not as a replacement for Unreal.
-- Mock compile-error semantics intentionally include `UNKNOWN_SIGNAL` for eval coverage. The current UE compiler does not emit that exact code yet, so mock error codes are a documented superset until Round 8 aligns signal validation.
+- The mock bridge mirrors the HF UESpec plugin surface (components, the 7 converters, signals, action events/primitives with `supported`/`unimplemented` status) and a subset of its error codes (`UNSUPPORTED_BINDING_PATH`, `UNRESOLVED_BINDING_PATH`, `UNSUPPORTED_BINDING_TARGET`, `UNSUPPORTED_EVENT`, `UNSUPPORTED_ACTION`, `UNKNOWN_CONVERTER`, `UNKNOWN_WIDGET_TYPE`, `VM_METHOD_NOT_DECLARED`). `INVALID_CONVERTER` needs the live MVVM type system and is never emitted by the mock. The old mock-only `UNKNOWN_SIGNAL` was dropped because the plugin does not emit it; the eval cases that relied on it (`compile_error/case-03-unknown-signal`, `assertion_failed/case-02-state-transition-guard`, `timeout/case-01-wait-for-state-transition`) report `invalid_fixture` under the mock.
+- Schema keys that nothing consumes (`extends`, `resolutions`, `viewModel.scope`, `viewModel.fields[].notify`, binding `oneTime`, action `cooldown` and `sound`) carry `"x-status": "unsupported"` in `uispec.schema.json`; `validate_spec` accepts them and lists each in `warnings` as `UNSUPPORTED_KEY`.
+- Indexed or call bind paths (`skills[0].x`, `Fn()`) are rejected at schema validation as `UNSUPPORTED_BINDING_PATH`, the same code the UE compiler reports.
 - Screenshot eval cases ship without PNGs for licensing and size reasons.
 - The real commandlet bridge still requires a local Unreal project with the UESpec plugin installed.
 - The current real-LLM public report covers the four compile-error eval cases only.

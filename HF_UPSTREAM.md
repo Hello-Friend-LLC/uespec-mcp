@@ -14,6 +14,9 @@ the HF convention (DOC-0073, DOC-0074). HF changes live on branch `hf-main` only
 | HF branch | `hf-main` |
 | Companion plugin | https://github.com/Hello-Friend-LLC/UESpec (branch `hf-5-8`) |
 
+HF patches (WI-1586 t211): schema `x-status` markers + indexed-bind rejection, `validate_spec` `warnings`,
+`MockBridge` aligned to the plugin surface (converters, signals, action status, binding/action error codes).
+
 Update procedure: `git remote add upstream https://github.com/Mithril0rd/uespec-mcp-public.git`,
 fetch, merge `upstream/main` into `hf-main`, push, re-run `pytest -q`. Keep local patches as
 minimal, upstream-PR-shaped commits.

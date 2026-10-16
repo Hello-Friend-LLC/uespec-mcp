@@ -21,9 +21,11 @@
       "type": "string"
     },
     "extends": {
-      "type": "string"
+      "type": "string",
+      "x-status": "unsupported"
     },
     "resolutions": {
+      "x-status": "unsupported",
       "type": "array",
       "items": {
         "type": "string",
@@ -207,10 +209,13 @@
       "type": "object",
       "required": ["bind"],
       "properties": {
-        "bind": { "type": "string" },
+        "bind": {
+          "type": "string",
+          "pattern": "^[^\\[\\]()]*$"
+        },
         "convert": { "type": "string" },
         "fallback": {},
-        "oneTime": { "type": "boolean" }
+        "oneTime": { "type": "boolean", "x-status": "unsupported" }
       },
       "additionalProperties": false
     },
@@ -220,6 +225,7 @@
       "properties": {
         "class": { "type": "string" },
         "scope": {
+          "x-status": "unsupported",
           "type": "string",
           "enum": ["Transient", "PlayerState", "GameInstance", "Subsystem"]
         },
@@ -245,7 +251,7 @@
         "name": { "type": "string" },
         "type": { "type": "string" },
         "default": {},
-        "notify": { "type": "boolean" }
+        "notify": { "type": "boolean", "x-status": "unsupported" }
       },
       "additionalProperties": true
     },
@@ -324,8 +330,8 @@
           ]
         },
         "guard": { "type": "string" },
-        "cooldown": { "type": "number" },
-        "sound": { "type": "string" }
+        "cooldown": { "type": "number", "x-status": "unsupported" },
+        "sound": { "type": "string", "x-status": "unsupported" }
       },
       "additionalProperties": true
     },

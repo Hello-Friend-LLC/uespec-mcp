@@ -5,6 +5,10 @@ versioned public release yet, so entries are grouped by development round.
 
 ## Unreleased - prerelease cleanup
 
+- HF (WI-1586 t211): `validate_spec` rejects indexed/call bind paths with `UNSUPPORTED_BINDING_PATH` and
+  returns `UNSUPPORTED_KEY` warnings for schema keys marked `x-status: unsupported`; `MockBridge` mirrors the
+  UESpec plugin converters, signals, action event/primitive status and binding/action error codes.
+
 - Fixed FastMCP tool-registration compatibility across the fallback shim and the
   real FastMCP dependency.
 - Fixed a path separator assertion that made the default report-path test
