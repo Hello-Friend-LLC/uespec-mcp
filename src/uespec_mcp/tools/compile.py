@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..bridge import BridgeError, get_bridge, structured_error
+from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
 from . import context
 
 
@@ -18,19 +18,22 @@ def compile_spec_to_wbp(spec_path: str | None = None, output_dir: str | None = N
             "errors": [_path_resolution_error(exc)],
         }
 
-    resolved_output_dir = output_dir.strip() if output_dir else "/Game/UESpec/Generated"
+    bridge = get_bridge()
+    default_output_dir = getattr(getattr(bridge, "config", None), "output_dir", None) or "/Game/UESpec/Generated"
+    resolved_output_dir = output_dir.strip() if output_dir else default_output_dir
 
     try:
-        return get_bridge().compile_spec(resolved_spec, resolved_output_dir)
+        return bridge.compile_spec(resolved_spec, resolved_output_dir)
     except BridgeError as exc:
         return {
+            **bridge_error_fields(exc),
             "ok": False,
             "specPath": str(resolved_spec),
             "outputDir": resolved_output_dir,
             "generatedAssets": [],
             "errors": [
                 structured_error(
-                    "BRIDGE_ERROR",
+                    exc.code,
                     str(exc),
                     hint="Use an Unreal package path such as '/Game/UESpec/Generated' and configure Unreal bridge environment variables before compiling a spec.",
                 )

@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import contextvars
+import csv
+import datetime as _datetime
+import functools
+import io
 import json
 import os
 import platform
+import re
+import socket
 import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -30,7 +41,14 @@ def structured_error(
 
 
 class BridgeError(RuntimeError):
-    """Base bridge exception."""
+    """Base bridge exception. ``code`` is the structured error code tools surface."""
+
+    code = "BRIDGE_ERROR"
+
+    # Filled in by the instrumentation wrapper so tools can echo them on an error result.
+    backend: str | None = None
+    correlation_id: str | None = None
+    duration_ms: float | None = None
 
 
 class BridgeConfigurationError(BridgeError):
@@ -45,6 +63,18 @@ class UnsupportedBridgeModeError(BridgeError):
     """Raised when a configured transport exists only as a placeholder."""
 
 
+class EditorUnavailableError(BridgeError):
+    """Live mode/auto mode: no UnrealMCPServer answered ``initialize`` in time. The bridge never launches an editor."""
+
+    code = "EDITOR_UNAVAILABLE"
+
+
+class LiveEditorRefusedError(BridgeError):
+    """Commandlet mode refuses to start while an editor process is alive (FND-01098)."""
+
+    code = "REFUSED_LIVE_EDITOR"
+
+
 class CommandletInvocation(BaseModel):
     ok: bool
     command: list[str] = Field(default_factory=list)
@@ -54,29 +84,241 @@ class CommandletInvocation(BaseModel):
     payload: Any = None
 
 
+PROJECT_CONFIG_RELATIVE_PATH = Path("UESpec") / "uespec.hf.json"
+DEFAULT_LIVE_PORT = 13579
+DEFAULT_LIVE_TIMEOUT_S = 120.0
+LIVE_CONNECT_TIMEOUT_S = 5.0
+BRIDGE_MODES = ("live", "commandlet", "mock", "auto")
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_project_config(project_root: Path | None) -> dict[str, Any]:
+    """Read ``<project>/UESpec/uespec.hf.json`` (projectPath, enginePath, outputDir, maxAttempts, ...). Missing/invalid -> {}."""
+    if project_root is None:
+        return {}
+    path = project_root / PROJECT_CONFIG_RELATIVE_PATH
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class BridgeConfig(BaseModel):
     uproject_path: Path | None = None
     ue_engine_path: Path | None = None
     mode: str = "commandlet"
+    project_root: Path | None = None
+    output_dir: str | None = None
+    max_attempts: int | None = None
+    allow_live_editor: bool = False
+    live_timeout_s: float = DEFAULT_LIVE_TIMEOUT_S
+    live_connect_timeout_s: float = LIVE_CONNECT_TIMEOUT_S
+    live_url: str | None = None
+    live_token: str | None = None
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
-        raw_mode = (os.getenv("UESPEC_BRIDGE_MODE") or os.getenv("UESPEC_MCP_MODE") or "commandlet").strip().lower() or "commandlet"
-        engine_path = os.getenv("UESPEC_UE_ENGINE_PATH")
-        uproject_path = os.getenv("UESPEC_UPROJECT_PATH")
+        """Environment wins over ``<project>/UESpec/uespec.hf.json``; the default mode is ``auto`` (live editor or a structured error)."""
+        uproject_env = os.getenv("UESPEC_UPROJECT_PATH")
+        root_env = os.getenv("UESPEC_PROJECT_ROOT")
+        project_root: Path | None = None
+        if root_env:
+            project_root = Path(root_env).expanduser()
+        elif uproject_env:
+            project_root = Path(uproject_env).expanduser().parent
+        file_config = load_project_config(project_root)
+
+        raw_mode = (
+            os.getenv("UESPEC_BRIDGE_MODE") or os.getenv("UESPEC_MCP_MODE") or str(file_config.get("mode") or "") or "auto"
+        ).strip().lower() or "auto"
+
+        engine_path = os.getenv("UESPEC_UE_ENGINE_PATH") or file_config.get("enginePath")
+        uproject_value = uproject_env or file_config.get("projectPath")
+        uproject_path: Path | None = None
+        if uproject_value:
+            uproject_path = Path(str(uproject_value)).expanduser()
+            if not uproject_path.is_absolute() and project_root is not None:
+                uproject_path = project_root / uproject_path
+        elif project_root is not None and project_root.is_dir():
+            candidates = sorted(project_root.glob("*.uproject"))
+            uproject_path = candidates[0] if candidates else None
+
+        max_attempts = file_config.get("maxAttempts")
+        timeout_env = os.getenv("UESPEC_LIVE_TIMEOUT_S")
+        timeout_value = timeout_env or file_config.get("liveTimeoutSeconds")
+        allow_env = os.getenv("UESPEC_ALLOW_LIVE_EDITOR")
         return cls(
-            uproject_path=Path(uproject_path).expanduser() if uproject_path else None,
-            ue_engine_path=Path(engine_path).expanduser() if engine_path else None,
+            uproject_path=uproject_path,
+            ue_engine_path=Path(str(engine_path)).expanduser() if engine_path else None,
             mode=raw_mode,
+            project_root=project_root,
+            output_dir=(os.getenv("UESPEC_OUTPUT_DIR") or file_config.get("outputDir") or None),
+            max_attempts=int(max_attempts) if isinstance(max_attempts, (int, float)) and not isinstance(max_attempts, bool) else None,
+            allow_live_editor=_truthy(allow_env if allow_env is not None else file_config.get("allowLiveEditor")),
+            live_timeout_s=float(timeout_value) if timeout_value else DEFAULT_LIVE_TIMEOUT_S,
+            live_url=os.getenv("UESPEC_LIVE_URL") or None,
+            live_token=os.getenv("UESPEC_LIVE_TOKEN") or None,
         )
+
+    def resolved_project_root(self) -> Path | None:
+        if self.project_root is not None:
+            return self.project_root
+        if self.uproject_path is not None:
+            return self.uproject_path.expanduser().parent
+        return None
+
+
+# ---------------------------------------------------------------------------------------------
+# Per-operation instrumentation: every bridge result carries backend/correlationId/durationMs/artifacts[],
+# and every operation appends one line to <project>/Saved/UESpec/logs/uespec_mcp.log.
+# ---------------------------------------------------------------------------------------------
+
+_CORRELATION_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("uespec_correlation_id", default=None)
+
+
+def current_correlation_id() -> str:
+    return _CORRELATION_ID.get() or str(uuid.uuid4())
+
+
+def _collect_artifacts(result: dict[str, Any]) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(kind: str, value: Any) -> None:
+        if isinstance(value, dict):
+            value = value.get("assetPath") or value.get("path")
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            artifacts.append({"kind": kind, "path": value})
+
+    for entry in result.get("generatedAssets") or []:
+        add("asset", entry)
+    add("package-file", result.get("savedPackageFile"))
+    add("junit", result.get("outputReport") or result.get("junitPath") or result.get("reportPath"))
+    add("failure-report", result.get("failureReportPath"))
+    return artifacts
+
+
+def _result_code(result: Any) -> str:
+    if not isinstance(result, dict):
+        return "ok"
+    if result.get("code"):
+        return str(result["code"])
+    if result.get("ok"):
+        return "ok"
+    errors = result.get("errors") or []
+    if errors and isinstance(errors[0], dict) and errors[0].get("code"):
+        return str(errors[0]["code"])
+    return "failed"
+
+
+def _log_operation(
+    config: Any,
+    route: str,
+    backend: str,
+    code: str,
+    duration_ms: float,
+    artifacts: int,
+    correlation_id: str,
+) -> None:
+    try:
+        root = config.resolved_project_root() if config is not None else None
+        if root is None:
+            return
+        log_path = Path(root) / "Saved" / "UESpec" / "logs" / "uespec_mcp.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = _datetime.datetime.now(_datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (
+            f"{stamp} route={route} backend={backend} project={Path(root).name} code={code} "
+            f"ms={duration_ms:.1f} artifacts={artifacts} correlationId={correlation_id}\n"
+        )
+        with log_path.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(line)
+    except OSError:
+        pass
+
+
+def _instrumented(route: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Stamp a bridge operation's result (or exception) and write the per-op log line.
+
+    Accepts an optional ``correlation_id=`` keyword on the wrapped method; absent -> a fresh uuid4.
+    """
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(self: Any, *args: Any, correlation_id: str | None = None, **kwargs: Any) -> Any:
+            cid = correlation_id or str(uuid.uuid4())
+            backend = getattr(self, "backend_name", "unknown")
+            token = _CORRELATION_ID.set(cid)
+            started = time.perf_counter()
+            try:
+                result = func(self, *args, **kwargs)
+            except BridgeError as exc:
+                elapsed = round((time.perf_counter() - started) * 1000.0, 1)
+                exc.backend = backend
+                exc.correlation_id = cid
+                exc.duration_ms = elapsed
+                _log_operation(getattr(self, "config", None), route, backend, exc.code, elapsed, 0, cid)
+                raise
+            finally:
+                _CORRELATION_ID.reset(token)
+            elapsed = round((time.perf_counter() - started) * 1000.0, 1)
+            if isinstance(result, dict):
+                if "durationMs" in result and "editorDurationMs" not in result:
+                    result["editorDurationMs"] = result["durationMs"]
+                result["backend"] = backend
+                result["correlationId"] = cid
+                result["durationMs"] = elapsed
+                result["artifacts"] = _collect_artifacts(result)
+                _log_operation(getattr(self, "config", None), route, backend, _result_code(result), elapsed, len(result["artifacts"]), cid)
+            return result
+
+        return wrapper
+
+    return decorator
+
+
+def bridge_error_fields(exc: BaseException) -> dict[str, Any]:
+    """Envelope fields a tool echoes when a bridge call raised instead of returning."""
+    return {
+        "backend": getattr(exc, "backend", None),
+        "correlationId": getattr(exc, "correlation_id", None) or str(uuid.uuid4()),
+        "durationMs": getattr(exc, "duration_ms", None) or 0.0,
+        "artifacts": [],
+    }
+
+
+def _live_editor_processes() -> list[str]:
+    """Names of live ``UnrealEditor*`` processes (UnrealEditor.exe, UnrealEditor-Cmd.exe, ...). Unknown -> []."""
+    try:
+        if platform.system() == "Windows":
+            completed = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=20, check=False
+            )
+            names = [row[0] for row in csv.reader(io.StringIO(completed.stdout)) if row]
+        else:
+            completed = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=20, check=False)
+            names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted({name for name in names if name.lower().startswith("unrealeditor")})
 
 
 class BridgeClient:
     """Bridge between Python MCP tools and Unreal commandlets."""
 
+    backend_name = "commandlet"
+
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self.config = config or BridgeConfig.from_env()
 
+    @_instrumented("surface")
     def get_support_surface(self, format: str = "markdown") -> dict[str, Any]:
         self._ensure_commandlet_mode()
         normalized_format = format.strip().lower()
@@ -104,6 +346,7 @@ class BridgeClient:
             "outputPath": invocation.outputPath,
         }
 
+    @_instrumented("validate")
     def validate_spec_content(self, spec_content: str) -> dict[str, Any]:
         self._ensure_commandlet_mode()
         with tempfile.TemporaryDirectory(prefix="uespec-mcp-validate-") as temp_dir:
@@ -123,6 +366,7 @@ class BridgeClient:
             )
         return normalize_compiler_result(invocation.payload, invocation.command, invocation.outputPath)
 
+    @_instrumented("compile")
     def compile_spec(self, spec_path: str | Path, output_dir: str) -> dict[str, Any]:
         self._ensure_commandlet_mode()
         spec_file = Path(spec_path).expanduser().resolve()
@@ -157,6 +401,7 @@ class BridgeClient:
             return {}
         return json.loads(resolved_path.read_text(encoding="utf-8"))
 
+    @_instrumented("test")
     def run_test_spec(
         self,
         spec_path: str | Path,
@@ -208,6 +453,14 @@ class BridgeClient:
     def _ensure_commandlet_mode(self) -> None:
         mode = self.config.mode.strip().lower()
         if mode == "commandlet":
+            if not self.config.allow_live_editor:
+                running = _live_editor_processes()
+                if running:
+                    raise LiveEditorRefusedError(
+                        f"Refusing to start a headless UnrealEditor-Cmd commandlet while an editor process is alive "
+                        f"({', '.join(running)}); a headless run beside a live editor stalls the host (FND-01098). "
+                        f"Use UESPEC_BRIDGE_MODE=live, close the editor, or set allow_live_editor=true."
+                    )
             return
         if mode == "socket":
             raise UnsupportedBridgeModeError(
@@ -434,9 +687,12 @@ class MockBridge:
     }
     _BINDING_TARGETS = ("content", "visibility")
 
+    backend_name = "mock"
+
     def __init__(self, config: BridgeConfig | None = None) -> None:
         self.config = config or BridgeConfig.from_env()
 
+    @_instrumented("surface")
     def get_support_surface(self, format: str = "markdown") -> dict[str, Any]:
         normalized_format = format.strip().lower()
         content = self._support_surface_json()
@@ -465,6 +721,7 @@ class MockBridge:
         ]
         return {"ok": True, "format": "markdown", "content": "\n".join(lines), "command": ["mock"]}
 
+    @_instrumented("validate")
     def validate_spec_content(self, spec_content: str) -> dict[str, Any]:
         try:
             parsed = json.loads(spec_content)
@@ -485,6 +742,7 @@ class MockBridge:
             "semanticValidation": {"status": "mock"},
         }
 
+    @_instrumented("compile")
     def compile_spec(self, spec_path: str | Path, output_dir: str) -> dict[str, Any]:
         spec_file = Path(spec_path).expanduser().resolve()
         try:
@@ -505,6 +763,7 @@ class MockBridge:
             return {}
         return json.loads(resolved_path.read_text(encoding="utf-8"))
 
+    @_instrumented("test")
     def run_test_spec(
         self,
         spec_path: str | Path,
@@ -812,6 +1071,416 @@ def normalize_compiler_result(
     }
 
 
+# ---------------------------------------------------------------------------------------------
+# Live editor bridge: Streamable-HTTP MCP client for HF UnrealMCPServer (uispec_* tools, hf_uispec provider).
+# Mirrors claude-plugin-hf-automation tools/wi-helpers/ue_driver.py `MCP` (initialize, Mcp-Session-Id, bearer
+# token, 429 backoff) without importing it.
+# ---------------------------------------------------------------------------------------------
+
+# A 429 means MaxRequestsPerMinute rejected the request before dispatch: nothing ran, so retrying is safe.
+RATE_LIMIT_BACKOFF_S: tuple[float, ...] = (2, 4, 8, 16, 32)
+POLL_INTERVALS_S: tuple[float, ...] = (0.5, 1.0, 1.0, 2.0)
+_SLEEP = time.sleep  # module-level so tests can stub them
+_MONOTONIC = time.monotonic
+NO_AUTH_PLACEHOLDER = "no-auth-token-required"
+_TOOL_DONE_STATES = {"completed", "failed"}
+
+
+class _McpTimeout(Exception):
+    """The request was sent (or connecting stalled) and no answer arrived in time."""
+
+
+class _McpTransportError(Exception):
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class _McpRpcError(Exception):
+    def __init__(self, error: Any) -> None:
+        super().__init__(json.dumps(error) if not isinstance(error, str) else error)
+        self.error = error
+
+
+class _McpHttpClient:
+    def __init__(self, url: str, token: str) -> None:
+        self.url = url
+        self.token = token
+        self.session_id: str | None = None
+        self.next_id = 1
+
+    def _post(self, payload: dict[str, Any], timeout: float) -> dict[str, Any] | None:
+        body = json.dumps(payload).encode("utf-8")
+        raw = ""
+        headers: dict[str, str] = {}
+        for delay in (*RATE_LIMIT_BACKOFF_S, None):
+            request = urllib.request.Request(self.url, data=body, method="POST")
+            request.add_header("Content-Type", "application/json")
+            request.add_header("Accept", "application/json, text/event-stream")
+            request.add_header("Authorization", f"Bearer {self.token}")
+            if self.session_id:
+                request.add_header("Mcp-Session-Id", self.session_id)
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    headers = dict(response.headers)
+                    raw = response.read().decode("utf-8", errors="replace")
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429 and delay is not None:
+                    _SLEEP(delay)
+                    continue
+                raise _McpTransportError(f"HTTP {exc.code} from {self.url}", status=exc.code) from exc
+            except (TimeoutError, socket.timeout) as exc:
+                raise _McpTimeout(str(exc) or "timed out") from exc
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                    raise _McpTimeout(str(exc.reason) or "timed out") from exc
+                raise _McpTransportError(str(exc.reason)) from exc
+            except OSError as exc:
+                raise _McpTransportError(str(exc)) from exc
+        session_id = headers.get("Mcp-Session-Id") or headers.get("mcp-session-id")
+        if session_id:
+            self.session_id = session_id
+        text = raw.strip()
+        if not text:
+            return None
+        if text.startswith("event:") or text.startswith("data:"):
+            for line in text.splitlines():
+                if line.startswith("data:"):
+                    return json.loads(line[5:].strip())
+            return None
+        return json.loads(text)
+
+    def request(self, method: str, params: dict[str, Any] | None, timeout: float) -> dict[str, Any]:
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "id": self.next_id, "method": method}
+        self.next_id += 1
+        if params is not None:
+            payload["params"] = params
+        try:
+            data = self._post(payload, timeout)
+        except json.JSONDecodeError as exc:
+            raise _McpTransportError(f"non-JSON reply to {method}: {exc}") from exc
+        if data is None:
+            raise _McpTransportError(f"empty reply to {method}")
+        if "error" in data:
+            raise _McpRpcError(data["error"])
+        result = data.get("result", {})
+        return result if isinstance(result, dict) else {}
+
+    def initialize(self, timeout: float) -> None:
+        self.request(
+            "initialize",
+            {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "uespec_mcp", "version": "1.0"}},
+            timeout,
+        )
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized"}, timeout)
+
+    def call_tool(self, name: str, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
+        return self.request("tools/call", {"name": name, "arguments": arguments}, timeout)
+
+
+def _extract_payload(result: Any) -> tuple[dict[str, Any], bool]:
+    """(payload dict, isError) from an MCP tools/call result: structuredContent first, else JSON text content."""
+    if not isinstance(result, dict):
+        return {}, False
+    is_error = bool(result.get("isError"))
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured, is_error
+    texts: list[str] = []
+    for item in result.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+            texts.append(item["text"])
+    for text in texts:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed, is_error
+    return ({"message": "\n".join(texts)} if texts else {}), is_error
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+class LiveEditorBridge:
+    """Talks to the running PrjEfz editor through HF UnrealMCPServer; never launches or kills an editor.
+
+    ``mode=live`` waits up to the call budget for ``initialize``; ``mode=auto`` gives it ``live_connect_timeout_s``
+    (5 s) and otherwise answers a structured ``EDITOR_UNAVAILABLE``. Calls are synchronous on the editor game
+    thread today (FND-01496); a reply carrying ``task_id`` is polled through ``get_task_status`` inside the same
+    budget, and on exhaustion the task is cancelled and the result is ``outcome: "uncertain"`` (a mutating call
+    is never retried).
+    """
+
+    backend_name = "live"
+
+    def __init__(self, config: BridgeConfig | None = None) -> None:
+        self.config = config or BridgeConfig.from_env()
+
+    # -- endpoint -------------------------------------------------------------------------------
+
+    def _endpoint(self) -> tuple[str, str]:
+        if self.config.live_url:
+            return self.config.live_url, self.config.live_token or NO_AUTH_PLACEHOLDER
+        root = self.config.resolved_project_root()
+        if root is None:
+            raise BridgeConfigurationError(
+                "Live mode needs the project: set UESPEC_PROJECT_ROOT (or UESPEC_UPROJECT_PATH) so Config/DefaultUnrealMCPServer.ini can be read."
+            )
+        port = DEFAULT_LIVE_PORT
+        token: str | None = None
+        require_auth = False
+        ini_path = Path(root) / "Config" / "DefaultUnrealMCPServer.ini"
+        try:
+            ini_lines = ini_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            ini_lines = []
+        for line in ini_lines:
+            stripped = line.strip()
+            match = re.match(r"ServerPort\s*=\s*(\d+)", stripped, re.IGNORECASE)
+            if match:
+                port = int(match.group(1))
+            match = re.match(r"\+?AuthTokens\s*=\s*(\S+)", stripped, re.IGNORECASE)
+            if match and token is None:
+                token = match.group(1)
+            match = re.match(r"bRequireAuthToken\s*=\s*(\w+)", stripped, re.IGNORECASE)
+            if match:
+                require_auth = match.group(1).lower() == "true"
+        if require_auth and token is None:
+            raise BridgeConfigurationError(f"{ini_path} sets bRequireAuthToken=True but has no AuthTokens entry.")
+        return f"http://127.0.0.1:{port}/mcp", token or NO_AUTH_PLACEHOLDER
+
+    def _open(self) -> _McpHttpClient:
+        url, token = self._endpoint()
+        mode = self.config.mode.strip().lower()
+        timeout = self.config.live_connect_timeout_s if mode == "auto" else self.config.live_timeout_s
+        client = _McpHttpClient(url, token)
+        try:
+            client.initialize(timeout)
+        except (_McpTimeout, _McpTransportError, _McpRpcError) as exc:
+            hint = " (HTTP 401: check AuthTokens in Config/DefaultUnrealMCPServer.ini)" if getattr(exc, "status", None) == 401 else ""
+            raise EditorUnavailableError(
+                f"No UnrealMCPServer answered initialize at {url} within {timeout:g}s: {exc}{hint}. "
+                f"The bridge never launches an editor; start the project editor and retry."
+            ) from exc
+        return client
+
+    # -- one tool call ----------------------------------------------------------------------------
+
+    def _invoke(self, tool: str, arguments: dict[str, Any], *, target: str, mutating: bool) -> dict[str, Any]:
+        correlation_id = current_correlation_id()
+        envelope: dict[str, Any] = {"correlationId": correlation_id}
+        for key, env_name in (("workId", "UESPEC_WORK_ID"), ("todoId", "UESPEC_TODO_ID")):
+            value = os.getenv(env_name)
+            if value:
+                envelope[key] = value
+        call_arguments = {**arguments, "_hf": envelope}
+        deadline = _MONOTONIC() + self.config.live_timeout_s
+        client = self._open()
+        try:
+            reply = client.call_tool(tool, call_arguments, timeout=max(1.0, deadline - _MONOTONIC()))
+        except (_McpTimeout, _McpTransportError) as exc:
+            if not mutating:
+                raise EditorUnavailableError(f"Live call '{tool}' got no answer: {exc}.") from exc
+            return self._uncertain(tool, target, None, f"Live call '{tool}' got no answer ({exc}); the editor may still be running it.", False)
+        except _McpRpcError as exc:
+            return self._rpc_error(tool, exc)
+
+        payload, is_error = _extract_payload(reply)
+        task_id = payload.get("task_id") or payload.get("taskId")
+        if task_id and "ok" not in payload:
+            return self._poll_task(client, str(task_id), tool, target, deadline, mutating)
+        return self._finalize(payload, is_error)
+
+    def _poll_task(
+        self, client: _McpHttpClient, task_id: str, tool: str, target: str, deadline: float, mutating: bool
+    ) -> dict[str, Any]:
+        step = 0
+        while True:
+            remaining = deadline - _MONOTONIC()
+            if remaining <= 0:
+                break
+            _SLEEP(min(POLL_INTERVALS_S[min(step, len(POLL_INTERVALS_S) - 1)], remaining))
+            step += 1
+            remaining = deadline - _MONOTONIC()
+            if remaining <= 0:
+                break
+            try:
+                status_reply = client.call_tool("get_task_status", {"task_id": task_id}, timeout=min(30.0, max(1.0, remaining)))
+            except (_McpTimeout, _McpTransportError):
+                continue
+            except _McpRpcError as exc:
+                return self._rpc_error("get_task_status", exc)
+            snapshot, _ = _extract_payload(status_reply)
+            state = str(snapshot.get("status") or "").lower()
+            if state in _TOOL_DONE_STATES:
+                payload, is_error = _extract_payload(snapshot.get("result"))
+                return self._finalize(payload, is_error or state == "failed")
+            if state == "cancelled":
+                result = self._uncertain(tool, target, task_id, f"Task {task_id} for '{tool}' was cancelled in the editor.", False)
+                result.update({"outcome": "cancelled", "code": "TASK_CANCELLED"})
+                result["errors"] = [structured_error("TASK_CANCELLED", result["errors"][0]["message"])]
+                return result
+        cancelled = False
+        try:
+            client.call_tool("cancel_task", {"task_id": task_id}, timeout=10.0)
+            cancelled = True
+        except (_McpTimeout, _McpTransportError, _McpRpcError):
+            pass
+        budget = self.config.live_timeout_s
+        return self._uncertain(
+            tool,
+            target,
+            task_id,
+            f"Task {task_id} for '{tool}' did not finish within the {budget:g}s call budget; cancel_task {'requested' if cancelled else 'failed'}.",
+            cancelled,
+        )
+
+    @staticmethod
+    def _uncertain(tool: str, target: str, task_id: str | None, message: str, cancel_requested: bool) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "outcome": "uncertain",
+            "code": "OUTCOME_UNCERTAIN",
+            "tool": tool,
+            "target": target,
+            "taskId": task_id,
+            "cancelRequested": cancel_requested,
+            "errors": [
+                structured_error(
+                    "OUTCOME_UNCERTAIN",
+                    message,
+                    path=target or "$",
+                    hint="Re-query the target (uispec_get_artifact / asset registry) before any retry; this bridge never auto-retries a mutating call.",
+                )
+            ],
+        }
+
+    @staticmethod
+    def _rpc_error(tool: str, exc: _McpRpcError) -> dict[str, Any]:
+        error = exc.error if isinstance(exc.error, dict) else {"message": str(exc.error)}
+        message = str(error.get("message") or exc)
+        return {
+            "ok": False,
+            "code": "MCP_RPC_ERROR",
+            "tool": tool,
+            "rpcError": error,
+            "errors": [structured_error("MCP_RPC_ERROR", message, hint="The editor rejected the request; check the tool name and argument names (uispec_* tools reject undeclared arguments).")],
+        }
+
+    @staticmethod
+    def _finalize(payload: dict[str, Any], is_error: bool) -> dict[str, Any]:
+        result = dict(payload)
+        if is_error:
+            code = str(result.get("code") or "TOOL_ERROR")
+            message = str(result.get("message") or result.get("error") or "The editor tool reported an error.")
+            result["ok"] = False
+            result["code"] = code
+            if not result.get("errors"):
+                result["errors"] = [structured_error(code, message, hint=str(result.get("hint") or ""))]
+        if "errors" in result:
+            result["errors"] = [normalize_error(entry) for entry in result.get("errors") or []]
+        return result
+
+    # -- bridge API -------------------------------------------------------------------------------
+
+    @_instrumented("surface")
+    def get_support_surface(self, format: str = "markdown") -> dict[str, Any]:
+        normalized_format = format.strip().lower()
+        if normalized_format not in {"markdown", "json"}:
+            raise BridgeConfigurationError("Support surface format must be 'markdown' or 'json'.")
+        payload = self._invoke("uispec_capabilities", {"includeSurface": True}, target="supportSurface", mutating=False)
+        surface = payload.get("supportSurface")
+        if not isinstance(surface, dict):
+            payload["ok"] = False
+            payload.setdefault("errors", [structured_error("SUPPORT_SURFACE_UNAVAILABLE", "uispec_capabilities returned no supportSurface.")])
+            payload.setdefault("format", normalized_format)
+            payload.setdefault("content", None)
+            return payload
+        content: Any = surface
+        if normalized_format == "markdown":
+            content = "# UESpec support surface (live editor)\n\n```json\n" + json.dumps(surface, indent=2, sort_keys=True) + "\n```\n"
+        identity = {key: payload[key] for key in ("engineVersion", "pluginSha", "hfPluginsSha", "surfaceHash", "projectPath") if key in payload}
+        return {"ok": True, "format": normalized_format, "content": content, "identity": identity, "command": ["live", "uispec_capabilities"], "outputPath": None}
+
+    @_instrumented("validate")
+    def validate_spec_content(self, spec_content: str) -> dict[str, Any]:
+        result = self._invoke("uispec_validate", {"specJson": spec_content}, target="specJson", mutating=False)
+        result.setdefault("normalizedJson", None)
+        result.setdefault("errors", [])
+        if result.get("code") or result.get("outcome"):
+            # The editor never produced a validation verdict (tool error, rpc error, uncertain): not a semantic answer.
+            result["validationLevel"] = "schema-only"
+            result["semanticValidation"] = {"status": "failed", "backend": "live", "code": result.get("code")}
+        else:
+            result["validationLevel"] = "semantic"
+            result["semanticValidation"] = {"status": "completed", "backend": "live"}
+        return result
+
+    @_instrumented("compile")
+    def compile_spec(self, spec_path: str | Path, output_dir: str) -> dict[str, Any]:
+        spec_file = Path(spec_path).expanduser().resolve()
+        normalized_output_dir = output_dir.strip()
+        if not normalized_output_dir:
+            raise BridgeConfigurationError("compile_spec requires a non-empty Unreal package output directory, for example '/Game/UESpec/Generated'.")
+        result = self._invoke(
+            "uispec_compile",
+            {"specPath": spec_file.as_posix(), "outputDir": normalized_output_dir},
+            target=normalized_output_dir,
+            mutating=True,
+        )
+        result.setdefault("generatedAssets", [])
+        result["specPath"] = str(spec_file)
+        result["outputDir"] = normalized_output_dir
+        return result
+
+    def read_failure_report(self, report_path: str | Path) -> dict[str, Any]:
+        resolved_path = Path(report_path).expanduser().resolve()
+        if not resolved_path.is_file():
+            return {}
+        try:
+            return json.loads(resolved_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @_instrumented("test")
+    def run_test_spec(
+        self,
+        spec_path: str | Path,
+        output_report: str | Path,
+        failure_report_path: str | Path | None = None,
+    ) -> dict[str, Any]:
+        """Run a test spec in the live editor. The editor writes the JUnit file only under ``<project>/Saved/UESpec``
+        (an ``output_report`` elsewhere is ignored in favour of the editor default) and picks the failure-report path itself."""
+        spec_file = Path(spec_path).expanduser().resolve()
+        junit_path = Path(output_report).expanduser().resolve()
+        arguments: dict[str, Any] = {"testSpecPath": spec_file.as_posix()}
+        root = self.config.resolved_project_root()
+        if root is not None and _is_within(junit_path, Path(root) / "Saved" / "UESpec"):
+            arguments["junitPath"] = junit_path.as_posix()
+        payload = self._invoke("uispec_run_tests", arguments, target=junit_path.as_posix(), mutating=True)
+        resolved_report = str(payload.get("junitPath") or payload.get("reportPath") or junit_path)
+        resolved_failure = str(payload.get("failureReportPath") or failure_report_path or "")
+        result: dict[str, Any] = {
+            **payload,
+            "ok": bool(payload.get("ok", False)),
+            "specPath": str(spec_file),
+            "outputReport": resolved_report,
+            "failureReportPath": resolved_failure,
+            "summary": payload.get("summary", {}),
+            "errors": [normalize_error(entry) for entry in payload.get("errors", [])],
+            "failureReport": self.read_failure_report(resolved_failure) if resolved_failure else {},
+        }
+        return result
+
+
 _BRIDGE: Any | None = None
 
 
@@ -819,7 +1488,12 @@ def get_bridge() -> Any:
     global _BRIDGE
     if _BRIDGE is None:
         config = BridgeConfig.from_env()
-        _BRIDGE = MockBridge(config) if config.mode == "mock" else BridgeClient(config)
+        if config.mode == "mock":
+            _BRIDGE = MockBridge(config)
+        elif config.mode in {"live", "auto"}:
+            _BRIDGE = LiveEditorBridge(config)
+        else:
+            _BRIDGE = BridgeClient(config)
     return _BRIDGE
 
 

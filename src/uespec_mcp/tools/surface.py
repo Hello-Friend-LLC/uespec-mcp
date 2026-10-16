@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..bridge import BridgeError, get_bridge, structured_error
+from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
 
 
 _SUPPORT_SURFACE_CACHE: dict[str, Any] | None = None
@@ -14,12 +14,13 @@ def get_support_surface(format: str = "markdown") -> dict[str, Any]:
         result = get_bridge().get_support_surface(format=format)
     except BridgeError as exc:
         return {
+            **bridge_error_fields(exc),
             "ok": False,
             "format": format,
             "content": None,
             "errors": [
                 structured_error(
-                    "BRIDGE_ERROR",
+                    exc.code,
                     str(exc),
                     path="$.format",
                     hint="Set UESPEC_UPROJECT_PATH and, if needed, UESPEC_UE_ENGINE_PATH before calling UE-backed tools.",

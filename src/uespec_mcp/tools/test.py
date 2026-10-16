@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..bridge import BridgeError, get_bridge, structured_error
+from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
 from . import context
 
 
@@ -49,6 +49,7 @@ def run_test_spec(
         return get_bridge().run_test_spec(resolved_spec, resolved_report, resolved_failure_report)
     except BridgeError as exc:
         return {
+            **bridge_error_fields(exc),
             "ok": False,
             "specPath": str(resolved_spec),
             "outputReport": str(resolved_report),
@@ -57,7 +58,7 @@ def run_test_spec(
             "failureReport": {},
             "errors": [
                 structured_error(
-                    "BRIDGE_ERROR",
+                    exc.code,
                     str(exc),
                     hint="Configure Unreal bridge environment variables before running test specs.",
                 )

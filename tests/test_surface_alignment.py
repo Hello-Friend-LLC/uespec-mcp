@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -58,7 +60,8 @@ def test_schema_rejects_indexed_and_call_bind_paths_on_content_and_visibility() 
     ]
 
 
-def test_schema_accepts_flat_and_nested_field_bind_paths() -> None:
+def test_schema_accepts_flat_and_nested_field_bind_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UESPEC_BRIDGE_MODE", "mock")  # semantic stage must have a bridge; schema acceptance is what is asserted
     document = _spec([{"id": "hp", "type": "ProgressBar", "content": {"bind": "vm.health.current", "convert": "Percent"}}])
 
     result = validate.validate_spec(json.dumps(document))
@@ -66,7 +69,8 @@ def test_schema_accepts_flat_and_nested_field_bind_paths() -> None:
     assert result["errors"] == []
 
 
-def test_unsupported_keys_warn_at_every_nesting_level_without_failing_validation() -> None:
+def test_unsupported_keys_warn_at_every_nesting_level_without_failing_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UESPEC_BRIDGE_MODE", "mock")
     document = _spec(
         [
             {

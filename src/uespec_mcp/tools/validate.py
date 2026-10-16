@@ -6,7 +6,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
-from ..bridge import BridgeError, get_bridge, structured_error
+from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
 
 
 _SCHEMA: dict[str, Any] | None = None
@@ -40,6 +40,7 @@ def validate_spec(spec_content: str) -> dict[str, Any]:
             "ok": False,
             "stage": "schema",
             "normalizedJson": None,
+            "validationLevel": "schema-only",
             "errors": [_schema_error_to_structured_error(error) for error in schema_errors],
             "warnings": warnings,
             "semanticValidation": {"status": "skipped", "reason": "Schema validation failed."},
@@ -49,17 +50,28 @@ def validate_spec(spec_content: str) -> dict[str, Any]:
     try:
         semantic = get_bridge().validate_spec_content(normalized_json)
     except BridgeError as exc:
+        # Never ok:true with the semantic stage skipped: the caller would read "valid" for a spec the compiler never saw.
         return {
-            "ok": True,
+            **bridge_error_fields(exc),
+            "ok": False,
+            "code": "BRIDGE_UNAVAILABLE",
             "stage": "schema",
+            "validationLevel": "schema-only",
             "normalizedJson": normalized_json,
-            "errors": [],
+            "errors": [
+                structured_error(
+                    "BRIDGE_UNAVAILABLE",
+                    f"Semantic validation could not run ({exc.code}): {exc}",
+                    hint="Start the project editor (live mode) or configure the commandlet bridge, then validate again. The spec passed JSON-schema validation only.",
+                )
+            ],
             "warnings": warnings,
-            "semanticValidation": {"status": "skipped", "reason": str(exc)},
+            "semanticValidation": {"status": "skipped", "reason": str(exc), "bridgeCode": exc.code},
         }
 
     semantic["stage"] = "semantic"
     semantic["warnings"] = warnings
+    semantic.setdefault("validationLevel", "semantic")
     semantic.setdefault("semanticValidation", {"status": "completed"})
     if semantic.get("normalizedJson") is None:
         semantic["normalizedJson"] = normalized_json
