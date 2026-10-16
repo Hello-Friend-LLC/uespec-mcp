@@ -48,7 +48,7 @@ def _compile_one(spec_path: str | None, output_dir: str | None) -> dict[str, Any
                 structured_error(
                     exc.code,
                     str(exc),
-                    hint="Use an Unreal package path such as '/Game/UESpec/Generated' and configure Unreal bridge environment variables before compiling a spec.",
+                    hint="Bridge unavailable: start the project editor (live bridge), or close it and set UESPEC_BRIDGE_MODE=commandlet with UESPEC_PROJECT_ROOT/UESPEC_UE_ENGINE_PATH configured, then retry.",
                 )
             ],
         }

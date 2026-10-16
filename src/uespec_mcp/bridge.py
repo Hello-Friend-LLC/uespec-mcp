@@ -323,11 +323,18 @@ def _live_editor_processes() -> list[str]:
     try:
         if platform.system() == "Windows":
             completed = subprocess.run(
-                ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, timeout=20, check=False
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=20,
+                check=False,
             )
             names = [row[0] for row in csv.reader(io.StringIO(completed.stdout)) if row]
         else:
-            completed = subprocess.run(["ps", "-A", "-o", "comm="], capture_output=True, text=True, timeout=20, check=False)
+            completed = subprocess.run(
+                ["ps", "-A", "-o", "comm="], capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=20, check=False
+            )
             names = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
     except (OSError, subprocess.SubprocessError):
         return []
@@ -534,6 +541,7 @@ class BridgeClient:
         completed = subprocess.run(
             command,
             capture_output=True,
+            stdin=subprocess.DEVNULL,  # FND-01502: the editor must never inherit the MCP stdio pipe (hangs at LogPython)
             text=True,
             encoding="utf-8",
             errors="replace",

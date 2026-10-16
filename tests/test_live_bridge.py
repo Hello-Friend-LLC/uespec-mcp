@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -449,6 +450,37 @@ def test_allow_live_editor_lets_the_commandlet_start(monkeypatch: pytest.MonkeyP
 
     assert result["ok"] is True and result["backend"] == "commandlet"
     assert captured["commandlet"] == "UESpecCompile"
+
+
+def test_commandlet_launch_never_inherits_the_mcp_stdin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """FND-01502: UnrealEditor-Cmd inherited the MCP stdio pipe and hung 600 s at LogPython."""
+    client = BridgeClient(BridgeConfig(mode="commandlet", uproject_path=tmp_path / "P.uproject", project_root=tmp_path))
+    monkeypatch.setattr(client, "_resolve_editor_cmd", lambda: tmp_path / "UnrealEditor-Cmd.exe")
+    seen: list[dict[str, Any]] = []
+
+    def fake_run(command: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(bridge.subprocess, "run", fake_run)
+
+    client._run_commandlet("UESpecCompile", [])
+
+    assert seen and seen[0].get("stdin") is subprocess.DEVNULL
+
+
+def test_editor_unavailable_hint_names_the_real_remedy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class _Down:
+        def compile_spec(self, spec: Path, output_dir: str) -> Any:
+            raise EditorUnavailableError("no editor answering on the MCP port")
+
+    monkeypatch.setattr(compile_tools, "get_bridge", lambda: _Down())
+
+    result = compile_tools.compile_spec_to_wbp(str(_write(tmp_path / "spec.json")), "/Game/T")
+
+    hint = result["errors"][0]["hint"]
+    assert "start the project editor" in hint and "UESPEC_BRIDGE_MODE=commandlet" in hint
+    assert "/Game/UESpec/Generated" not in hint
 
 
 @pytest.mark.parametrize(
