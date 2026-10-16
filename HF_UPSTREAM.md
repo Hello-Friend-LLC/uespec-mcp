@@ -21,5 +21,7 @@ Update procedure: `git remote add upstream https://github.com/Mithril0rd/uespec-
 fetch, merge `upstream/main` into `hf-main`, push, re-run `pytest -q`. Keep local patches as
 minimal, upstream-PR-shaped commits.
 
+HF patches (WI-1586 t500): host-driven repair flow (`tools/repair.py`, `orchestrator/repair_history.py`, `orchestrator/assertion_guard.py`), `autofix_spec`, compile ledger hook in `compile_spec_to_wbp`.
+
 HF patches (WI-1586 t420): removed the global active spec, array `spec_path`, absolute `artifacts[]`, on-disk surface cache
 (`surface_cache.py`), `get_component_catalog` / `get_schema`, compact `tools/list`, compact artifact replies (`tools/_envelope.py`).

@@ -31,7 +31,12 @@ def _compile_one(spec_path: str | None, output_dir: str | None) -> dict[str, Any
     resolved_output_dir = output_dir.strip() if output_dir else default_output_dir
 
     try:
-        return bridge.compile_spec(resolved_spec, resolved_output_dir)
+        result = bridge.compile_spec(resolved_spec, resolved_output_dir)
+        if isinstance(result, dict) and result.get("ok"):
+            from . import repair  # lazy: repair imports this module
+
+            repair.record_compile(resolved_spec, result)  # which asset came from which spec text (rollback_spec uses it)
+        return result
     except BridgeError as exc:
         return {
             **bridge_error_fields(exc),

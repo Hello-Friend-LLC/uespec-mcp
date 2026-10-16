@@ -505,7 +505,7 @@ def test_orchestrator_tools_register_on_server(monkeypatch: pytest.MonkeyPatch) 
     tools = server.list_registered_tools(mcp)
 
     assert "propose_patch_from_failure" in tools
-    assert "run_with_autofix" in tools
+    assert "autofix_spec" in tools
 
 
 def _write_ui_spec(path: Path, payload: dict[str, Any]) -> Path:

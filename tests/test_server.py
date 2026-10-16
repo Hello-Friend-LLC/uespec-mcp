@@ -350,11 +350,12 @@ def test_tools_list_is_compact_and_llm_tools_follow_the_provider(monkeypatch: py
     names = {tool.name for tool in tools}
 
     assert {"get_support_surface", "get_component_catalog", "get_schema", "validate_spec", "compile_spec_to_wbp", "run_test_spec", "preview_spec"} <= names
-    assert not names & {"run_with_autofix", "propose_patch_from_failure", "generate_spec_from_image", "set_active_spec", "get_active_spec"}
+    assert {"get_failure_report", "apply_spec_patch", "rollback_spec", "repair_status"} <= names
+    assert not names & {"autofix_spec", "run_with_autofix", "propose_patch_from_failure", "generate_spec_from_image", "set_active_spec", "get_active_spec"}
     for tool in tools:
         assert "\n" not in (tool.description or "") and len(tool.description or "") <= 420, tool.name
         assert tool.outputSchema is None, tool.name
-    assert len(json.dumps([tool.model_dump(mode="json", exclude_none=True) for tool in tools])) < 5000
+    assert len(json.dumps([tool.model_dump(mode="json", exclude_none=True) for tool in tools])) < 6200
 
     monkeypatch.setenv("UESPEC_LLM_PROVIDER", "mock")
-    assert "run_with_autofix" in server.list_registered_tools(server.build_server())
+    assert "autofix_spec" in server.list_registered_tools(server.build_server())

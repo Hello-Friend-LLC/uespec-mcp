@@ -27,7 +27,7 @@ except ImportError:
 
 
 from .tools import compile as compile_tools
-from .tools import generate, orchestrator, preview, surface, test as test_tools, validate
+from .tools import generate, orchestrator, preview, repair, surface, test as test_tools, validate
 
 FastMCP = _FastMCP
 
@@ -48,7 +48,7 @@ def llm_tools_enabled() -> bool:
 
 def build_server() -> FastMCP:
     mcp = FastMCP("uespec", include_fastmcp_meta=False)
-    modules = [surface, validate, compile_tools, test_tools, preview]
+    modules = [surface, validate, compile_tools, test_tools, preview, repair]
     if llm_tools_enabled():
         modules += [orchestrator, generate]
     for module in modules:

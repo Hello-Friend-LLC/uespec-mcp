@@ -5,6 +5,14 @@ versioned public release yet, so entries are grouped by development round.
 
 ## Unreleased - prerelease cleanup
 
+- HF (WI-1586 t500): default repair flow driven by the host Claude session. `get_failure_report` returns structured
+  failures (code, JSON pointer, nearest names, candidate patch) for a spec or test spec; `apply_spec_patch` records
+  `PatchHistory/<spec-stem>/<n>.json` before touching the spec and enforces an attempt limit
+  (`REPAIR_LIMIT_REACHED`); `rollback_spec` restores any earlier state and recompiles the asset in place;
+  `repair_status`; a regression guard rejects test-spec patches that remove assertions or lower expected counts
+  (`ASSERTION_REMOVAL_REJECTED`). The provider loop is now `autofix_spec` (default provider `none` ->
+  `PROVIDER_NOT_CONFIGURED`); `propose_patch_from_failure` rejects the arguments it used to ignore.
+
 - HF (WI-1586 t420): compact, cached, session-safe discovery. Removed the process-global active spec
   (`set_active_spec` / `get_active_spec`; every tool takes an explicit `spec_path`, error `SPEC_PATH_REQUIRED`);
   `compile_spec_to_wbp` / `run_test_spec` / `preview_spec` accept arrays of spec paths and `artifacts[]` file paths are

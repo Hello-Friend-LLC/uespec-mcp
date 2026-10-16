@@ -119,11 +119,15 @@ and absolute paths for files. Replies from the artifact-returning tools stay und
 - `validate_spec`
 - `compile_spec_to_wbp`
 - `run_test_spec`
-- `get_failure_report`
+- Host-driven repair flow (no nested LLM call; state under `<project>/Saved/UESpec/PatchHistory/<spec-stem>/`):
+  `get_failure_report` (`spec_path` validates, `compile=true` also compiles, `test_spec_path` runs a test spec; returns code, JSON pointer, nearest names and a `candidatePatch`; `report_path` alone reads a report file),
+  `apply_spec_patch` (RFC 6902 `patch`, `note`; writes `<n>.json` {before, after, patch, note, ts} before touching the spec, then validates; `REPAIR_LIMIT_REACHED` after `maxAttempts` failing attempts, default 3, `UESPEC_MAX_ATTEMPTS` or project `maxAttempts`; test specs reject assertion removal or lowered expected counts with `ASSERTION_REMOVAL_REJECTED` unless `allow_assertion_change` and `reason`),
+  `rollback_spec` (`to` = attempt number, 0 = original; recompiles the asset in place when it was built from a later state and compares the asset hash),
+  `repair_status` (`reset=true` starts a new repair session)
 - `list_existing_specs`
 - `preview_spec` (live editor only: compile, then offscreen render through VibeUE `capture_preview_state`; PIE is driven by `ue_driver.py`/HF tools, not the backend; `UESPEC_IMG_CHECK` enables the image verdict, `UESPEC_EPIC_URL` overrides the `:8000` fallback; a blank first capture is retried once)
 - `suggest_nearest`
-- LLM-adapter tools, registered only when a provider is configured (`UESPEC_LLM_PROVIDER`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`; force with `UESPEC_LLM_TOOLS=on|off`): `propose_patch_from_failure`, `run_with_autofix`, `generate_spec_from_image`, `generate_spec_from_image_with_autofix`
+- LLM-adapter tools, registered only when a provider is configured (`UESPEC_LLM_PROVIDER`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`; force with `UESPEC_LLM_TOOLS=on|off`): `propose_patch_from_failure`, `autofix_spec` (`provider` claude|openai|mock, default none -> `PROVIDER_NOT_CONFIGURED`), `generate_spec_from_image`, `generate_spec_from_image_with_autofix`
 
 ## Environment
 

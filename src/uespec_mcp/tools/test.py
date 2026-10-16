@@ -128,9 +128,3 @@ def register(mcp: Any) -> None:
         run_test_spec,
         compact=True,
     )
-    add_tool(
-        mcp,
-        "get_failure_report",
-        "Read a *.failure-report.json file and return its parsed payload.",
-        get_failure_report,
-    )
