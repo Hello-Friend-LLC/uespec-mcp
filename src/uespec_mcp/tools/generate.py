@@ -312,7 +312,7 @@ def _summarize_support_surface(snapshot: dict[str, Any]) -> str:
 def _extract_surface_names(snapshot: dict[str, Any], keys: list[str], name_key: str) -> list[str]:
     names: set[str] = set()
     for key in keys:
-        for entry in snapshot.get(key, []):
+        for entry in surface.surface_section(snapshot, key):
             if isinstance(entry, dict):
                 name = entry.get(name_key) or entry.get(name_key[:1].lower() + name_key[1:])
                 if isinstance(name, str) and name:

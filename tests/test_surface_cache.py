@@ -145,3 +145,19 @@ def test_get_schema_outline_and_section() -> None:
     assert "widget" in outline["sections"] and outline["ok"] is True
     assert validate.get_schema("widget")["schema"]
     assert validate.get_schema("nope")["errors"][0]["code"] == "UNKNOWN_SCHEMA_SECTION"
+
+
+def test_catalog_reads_the_live_editor_camel_case_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    live_surface = {
+        "builtInUMGWidgets": [{"type": "Border"}],
+        "registeredComponents": [{"type": "ChatLine"}],
+        "converters": [{"name": "BoolToVisibility"}],
+        "styleTokens": [{"name": "@color.chat.guild"}],
+        "signals": [{"name": "onChatMessageReceived"}],
+    }
+    monkeypatch.setattr(surface, "get_support_surface", lambda format="json", force=False: {"ok": True, "content": live_surface, "cache": "hit"})
+
+    catalog = surface.get_component_catalog()
+
+    assert catalog["catalog"]["widgets"] == ["Border", "ChatLine"]
+    assert catalog["counts"] == {"widgets": 2, "converters": 1, "tokens": 1, "signals": 1}

@@ -139,6 +139,14 @@ def suggest_nearest(needle: str, category: str) -> dict[str, Any]:
     }
 
 
+def surface_section(snapshot: dict[str, Any], key: str) -> list[Any]:
+    """A list section of the surface JSON: the commandlet emits PascalCase keys, the live editor camelCase."""
+    value = snapshot.get(key)
+    if value is None:
+        value = snapshot.get(key[:1].lower() + key[1:])
+    return value if isinstance(value, list) else []
+
+
 def _ensure_surface_json(force: bool = False) -> dict[str, Any] | None:
     """The JSON surface via get_support_surface, so it is served from the per-project disk cache (no process-global copy)."""
     result = get_support_surface(format="json", force=force)
@@ -189,7 +197,7 @@ def _extract_candidates(snapshot: dict[str, Any], category: str) -> list[str]:
     if category == "widget":
         widget_entries = []
         for key in ("BuiltInUMGWidgets", "CommonUIWidgets", "RegisteredComponents"):
-            widget_entries.extend(snapshot.get(key, []))
+            widget_entries.extend(surface_section(snapshot, key))
         return sorted(
             {
                 entry.get("Type") or entry.get("type")
@@ -201,7 +209,7 @@ def _extract_candidates(snapshot: dict[str, Any], category: str) -> list[str]:
         return sorted(
             {
                 entry.get("Name") or entry.get("name")
-                for entry in snapshot.get("Converters", [])
+                for entry in surface_section(snapshot, "Converters")
                 if isinstance(entry, dict) and (entry.get("Name") or entry.get("name"))
             }
         )
@@ -209,14 +217,14 @@ def _extract_candidates(snapshot: dict[str, Any], category: str) -> list[str]:
         return sorted(
             {
                 entry.get("Name") or entry.get("name")
-                for entry in snapshot.get("StyleTokens", [])
+                for entry in surface_section(snapshot, "StyleTokens")
                 if isinstance(entry, dict) and (entry.get("Name") or entry.get("name"))
             }
         )
     return sorted(
         {
             entry.get("Name") or entry.get("name")
-            for entry in snapshot.get("Signals", [])
+            for entry in surface_section(snapshot, "Signals")
             if isinstance(entry, dict) and (entry.get("Name") or entry.get("name"))
         }
     )
