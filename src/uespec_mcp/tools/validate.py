@@ -7,6 +7,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
+from ._register import add_tool
 
 
 _SCHEMA: dict[str, Any] | None = None
@@ -207,5 +208,51 @@ def _walk_unsupported(instance: Any, subschema: Any, root: dict[str, Any], path:
             _walk_unsupported(item, subschema["items"], root, f"{path}[{index}]", warnings)
 
 
+def get_schema(section: str | None = None) -> dict[str, Any]:
+    """Reference material kept out of tools/list: the UISpec JSON schema, or one ``$defs`` entry by name.
+
+    No ``section`` returns an outline (top-level keys, ``$defs`` names, byte sizes); ``section="all"`` returns the whole schema.
+    """
+    schema = _load_schema()
+    defs = schema.get("$defs", {})
+    if not section:
+        return {
+            "ok": True,
+            "schemaId": schema.get("$id"),
+            "topLevelKeys": sorted(schema.get("properties", {})),
+            "required": schema.get("required", []),
+            "sections": {name: len(json.dumps(body)) for name, body in sorted(defs.items())},
+            "hint": "Pass section=<name> for one definition or section='all' for the whole schema.",
+        }
+    if section == "all":
+        return {"ok": True, "schema": schema}
+    if section in defs:
+        return {"ok": True, "section": section, "schema": defs[section]}
+    if section in schema.get("properties", {}):
+        return {"ok": True, "section": section, "schema": schema["properties"][section]}
+    return {
+        "ok": False,
+        "errors": [
+            structured_error(
+                "UNKNOWN_SCHEMA_SECTION",
+                f"No schema section named '{section}'.",
+                path="$.section",
+                hint="Call get_schema with no arguments to list section names.",
+            )
+        ],
+    }
+
+
 def register(mcp: Any) -> None:
-    mcp.tool(name="validate_spec", description="Validate raw UISpec JSON against schema first, then Unreal semantic validation if available.")(validate_spec)
+    add_tool(
+        mcp,
+        "validate_spec",
+        "Validate UISpec JSON text: JSON schema first, then semantic validation in the editor. Never ok:true with the semantic stage skipped.",
+        validate_spec,
+    )
+    add_tool(
+        mcp,
+        "get_schema",
+        "Return the UISpec JSON schema outline, or one definition by section name ('all' for the whole schema).",
+        get_schema,
+    )

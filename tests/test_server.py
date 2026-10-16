@@ -18,9 +18,10 @@ from uespec_mcp.tools import context, surface, test as test_tools, validate
 
 
 @pytest.fixture(autouse=True)
-def reset_tool_state() -> None:
-    context._ACTIVE_SPEC = None
-    surface._SUPPORT_SURFACE_CACHE = None
+def isolated_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # No ambient project: caches and relative-path resolution must not read the developer's UESPEC_* environment.
+    for name in ("UESPEC_PROJECT_ROOT", "UESPEC_UPROJECT_PATH", "UESPEC_BRIDGE_MODE", "UESPEC_MCP_MODE"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_get_support_surface_no_ue(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,27 +73,111 @@ def test_list_existing_specs(tmp_path: Path) -> None:
     assert result["items"][0]["kind"] == "HUD"
 
 
-def test_session_active_spec(tmp_path: Path) -> None:
-    spec_path = tmp_path / "active-spec.json"
-    spec_path.write_text(
-        json.dumps(
-            {
-                "apiVersion": "0.2",
-                "kind": "HUD",
-                "name": "ActiveHUD",
-                "root": {"type": "CanvasPanel", "id": "rootPanel"},
-            }
-        ),
+def _write_hud(path: Path, name: str) -> Path:
+    path.write_text(
+        json.dumps({"apiVersion": "0.2", "kind": "HUD", "name": name, "root": {"type": "CanvasPanel", "id": "rootPanel"}}),
         encoding="utf-8",
     )
-
-    set_result = context.set_active_spec(str(spec_path))
-
-    assert set_result["ok"] is True
-    assert context.get_active_spec() == str(spec_path.resolve())
+    return path
 
 
-def test_compile_spec_to_wbp_uses_active_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_process_global_active_spec(tmp_path: Path) -> None:
+    tools = server.list_registered_tools(server.build_server())
+
+    assert "set_active_spec" not in tools and "get_active_spec" not in tools
+    assert not hasattr(context, "set_active_spec") and not hasattr(context, "_ACTIVE_SPEC")
+    for tool_name, call in (("compile_spec_to_wbp", lambda: compile_tools.compile_spec_to_wbp("")), ("run_test_spec", lambda: test_tools.run_test_spec(""))):
+        result = call()
+        assert result["ok"] is False, tool_name
+        assert result["errors"][0]["code"] == "SPEC_PATH_REQUIRED", tool_name
+
+
+def test_interleaved_clients_never_see_each_other_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two MCP clients share one backend process; a spec path sent by one must never be used for the other's call."""
+    import asyncio
+
+    from fastmcp import Client
+
+    spec_a = _write_hud(tmp_path / "client-a.json", "ClientAHUD")
+    spec_b = _write_hud(tmp_path / "client-b.json", "ClientBHUD")
+    seen: list[str] = []
+
+    class FakeBridge:
+        def compile_spec(self, spec_path_arg: Path, output_dir_arg: str) -> dict[str, object]:
+            seen.append(Path(spec_path_arg).name)
+            return {"ok": True, "generatedAssets": [f"/Game/UI/WBP_{Path(spec_path_arg).stem}"], "errors": []}
+
+    monkeypatch.setattr(compile_tools, "get_bridge", lambda: FakeBridge())
+    mcp = server.build_server()
+
+    async def run() -> list[dict[str, object]]:
+        async with Client(mcp) as client_a, Client(mcp) as client_b:
+            async def call(client: Client, arguments: dict[str, object]) -> dict[str, object]:
+                reply = await client.call_tool("compile_spec_to_wbp", arguments, raise_on_error=False)
+                return json.loads(reply.content[0].text)
+
+            first_a = await call(client_a, {"spec_path": str(spec_a)})
+            first_b = await call(client_b, {"spec_path": str(spec_b)})
+            # Neither client names a spec now: nothing may fall back to the other client's last path.
+            bare_a = await call(client_a, {"spec_path": ""})
+            bare_b = await call(client_b, {"spec_path": ""})
+            second_a = await call(client_a, {"spec_path": [str(spec_a)]})
+            return [first_a, first_b, bare_a, bare_b, second_a]
+
+    first_a, first_b, bare_a, bare_b, second_a = asyncio.run(run())
+
+    assert first_a["generatedAssets"] == ["/Game/UI/WBP_client-a"]
+    assert first_b["generatedAssets"] == ["/Game/UI/WBP_client-b"]
+    assert bare_a["errors"][0]["code"] == "SPEC_PATH_REQUIRED"
+    assert bare_b["errors"][0]["code"] == "SPEC_PATH_REQUIRED"
+    assert second_a["ok"] is True and second_a["count"] == 1
+    assert seen == ["client-a.json", "client-b.json", "client-a.json"]
+
+
+def test_array_spec_paths_resolve_on_the_executing_machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    specs = [_write_hud(tmp_path / f"hud-{index}.json", f"Hud{index}") for index in range(2)]
+    seen: list[str] = []
+
+    class FakeBridge:
+        def compile_spec(self, spec_path_arg: Path, output_dir_arg: str) -> dict[str, object]:
+            seen.append(str(spec_path_arg))
+            return {
+                "ok": True,
+                "generatedAssets": [f"/Game/UI/WBP_{Path(spec_path_arg).stem}"],
+                "outputReport": "Saved/UESpec/TestReports/relative.junit.xml",
+                "artifacts": [{"kind": "asset", "path": "/Game/UI/x"}],
+            }
+
+    monkeypatch.setattr(compile_tools, "get_bridge", lambda: FakeBridge())
+    result = compile_tools.compile_spec_to_wbp([str(specs[0]), str(specs[1]), str(tmp_path / "missing.json")])
+
+    assert seen == [str(path.resolve()) for path in specs]
+    assert result["count"] == 3 and result["failed"] == 1 and result["ok"] is False
+    assert result["results"][2]["errors"][0]["code"] == "SPEC_NOT_FOUND"
+
+
+def test_artifacts_are_absolute_file_paths(tmp_path: Path) -> None:
+    from uespec_mcp import bridge as bridge_module
+
+    config = bridge_module.BridgeConfig(project_root=tmp_path)
+    artifacts = bridge_module._collect_artifacts(
+        {
+            "generatedAssets": ["/Game/UI/WBP_A"],
+            "outputReport": "Saved/UESpec/TestReports/a.junit.xml",
+            "failureReportPath": str(tmp_path / "Saved" / "b.json"),
+            "pngPath": "Saved/WidgetPreviews/a.png",
+        },
+        config,
+    )
+
+    by_kind = {entry["kind"]: entry["path"] for entry in artifacts}
+    assert by_kind["asset"] == "/Game/UI/WBP_A"
+    for kind in ("junit", "failure-report", "png"):
+        assert Path(by_kind[kind]).is_absolute(), kind
+    assert Path(by_kind["png"]) == (tmp_path / "Saved" / "WidgetPreviews" / "a.png").resolve()
+
+
+def test_compile_spec_to_wbp_takes_explicit_spec_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     spec_path = tmp_path / "compile-me.json"
     spec_path.write_text(
         json.dumps(
@@ -105,7 +190,6 @@ def test_compile_spec_to_wbp_uses_active_spec(tmp_path: Path, monkeypatch: pytes
         ),
         encoding="utf-8",
     )
-    context.set_active_spec(str(spec_path))
 
     captured: dict[str, str] = {}
 
@@ -116,7 +200,7 @@ def test_compile_spec_to_wbp_uses_active_spec(tmp_path: Path, monkeypatch: pytes
             return {"ok": True, "generatedAssets": ["/Game/UI/WBP_CompileMeHUD"], "errors": []}
 
     monkeypatch.setattr(compile_tools, "get_bridge", lambda: FakeBridge())
-    result = compile_tools.compile_spec_to_wbp(output_dir="/Game/UI/Generated")
+    result = compile_tools.compile_spec_to_wbp(str(spec_path), output_dir="/Game/UI/Generated")
 
     assert result["ok"] is True
     assert captured["spec_path"] == str(spec_path.resolve())
@@ -136,7 +220,6 @@ def test_run_test_spec_uses_default_report_path(tmp_path: Path, monkeypatch: pyt
         ),
         encoding="utf-8",
     )
-    context.set_active_spec(str(spec_path))
 
     captured: dict[str, str] = {}
 
@@ -148,7 +231,7 @@ def test_run_test_spec_uses_default_report_path(tmp_path: Path, monkeypatch: pyt
             return {"ok": True, "summary": {"passed": 1, "failed": 0}, "errors": [], "failureReport": {}}
 
     monkeypatch.setattr(test_tools, "get_bridge", lambda: FakeBridge())
-    result = test_tools.run_test_spec()
+    result = test_tools.run_test_spec(str(spec_path))
 
     assert result["ok"] is True
     assert captured["spec_path"] == str(spec_path.resolve())
@@ -234,8 +317,8 @@ def test_get_failure_report_reads_json_file(tmp_path: Path) -> None:
     assert result["failureReport"] == report_payload
 
 
-def test_suggest_nearest_uses_support_surface_cache() -> None:
-    surface._SUPPORT_SURFACE_CACHE = {
+def test_suggest_nearest_uses_support_surface_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    snapshot = {
         "BuiltInUMGWidgets": [{"Type": "CanvasPanel"}, {"Type": "Button"}],
         "CommonUIWidgets": [{"Type": "CommonButtonBase"}],
         "RegisteredComponents": [{"Type": "SkillSlot"}],
@@ -243,8 +326,35 @@ def test_suggest_nearest_uses_support_surface_cache() -> None:
         "StyleTokens": [{"Name": "color.primary"}],
         "Signals": [{"Name": "onSkillUsed"}],
     }
+    monkeypatch.setattr(surface, "_ensure_surface_json", lambda force=False: snapshot)
 
     result = surface.suggest_nearest("SkillSlo", "widget")
 
     assert result["ok"] is True
     assert result["suggestions"][0] == "SkillSlot"
+
+
+def test_tools_list_is_compact_and_llm_tools_follow_the_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from fastmcp import Client
+
+    for name in ("UESPEC_LLM_TOOLS", "UESPEC_LLM_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    async def list_tools(mcp: object) -> list[object]:
+        async with Client(mcp) as client:
+            return await client.list_tools()
+
+    tools = asyncio.run(list_tools(server.build_server()))
+    names = {tool.name for tool in tools}
+
+    assert {"get_support_surface", "get_component_catalog", "get_schema", "validate_spec", "compile_spec_to_wbp", "run_test_spec", "preview_spec"} <= names
+    assert not names & {"run_with_autofix", "propose_patch_from_failure", "generate_spec_from_image", "set_active_spec", "get_active_spec"}
+    for tool in tools:
+        assert "\n" not in (tool.description or "") and len(tool.description or "") <= 420, tool.name
+        assert tool.outputSchema is None, tool.name
+    assert len(json.dumps([tool.model_dump(mode="json", exclude_none=True) for tool in tools])) < 5000
+
+    monkeypatch.setenv("UESPEC_LLM_PROVIDER", "mock")
+    assert "run_with_autofix" in server.list_registered_tools(server.build_server())

@@ -188,16 +188,29 @@ def current_correlation_id() -> str:
     return _CORRELATION_ID.get() or str(uuid.uuid4())
 
 
-def _collect_artifacts(result: dict[str, Any]) -> list[dict[str, str]]:
+def _absolute_file_path(value: str, config: Any) -> str:
+    """Absolute path of a file artifact on the executing machine; a relative one resolves against the project root."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        root = config.resolved_project_root() if config is not None and hasattr(config, "resolved_project_root") else None
+        path = (Path(root) / path) if root is not None else path
+    return path.resolve().as_posix()
+
+
+def _collect_artifacts(result: dict[str, Any], config: Any = None) -> list[dict[str, str]]:
+    """``artifacts[]``: package paths for assets (``/Game/...``), absolute filesystem paths for everything else."""
     artifacts: list[dict[str, str]] = []
     seen: set[str] = set()
 
     def add(kind: str, value: Any) -> None:
         if isinstance(value, dict):
             value = value.get("assetPath") or value.get("path")
-        if isinstance(value, str) and value and value not in seen:
-            seen.add(value)
-            artifacts.append({"kind": kind, "path": value})
+        if isinstance(value, str) and value:
+            if kind != "asset":
+                value = _absolute_file_path(value, config)
+            if value not in seen:
+                seen.add(value)
+                artifacts.append({"kind": kind, "path": value})
 
     for entry in result.get("generatedAssets") or []:
         add("asset", entry)
@@ -278,7 +291,7 @@ def _instrumented(route: str) -> Callable[[Callable[..., Any]], Callable[..., An
                 result["backend"] = backend
                 result["correlationId"] = cid
                 result["durationMs"] = elapsed
-                result["artifacts"] = _collect_artifacts(result)
+                result["artifacts"] = _collect_artifacts(result, getattr(self, "config", None))
                 _log_operation(getattr(self, "config", None), route, backend, _result_code(result), elapsed, len(result["artifacts"]), cid)
             return result
 

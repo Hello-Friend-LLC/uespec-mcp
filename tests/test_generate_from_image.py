@@ -200,7 +200,8 @@ def test_generate_spec_from_image_rejects_bad_target_kind(tmp_path: Path) -> Non
     assert result["errors"][0]["code"] == "INVALID_TARGET_KIND"
 
 
-def test_generate_tool_is_registered() -> None:
+def test_generate_tool_is_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UESPEC_LLM_TOOLS", "on")
     mcp = server.build_server()
     tools = server.list_registered_tools(mcp)
 

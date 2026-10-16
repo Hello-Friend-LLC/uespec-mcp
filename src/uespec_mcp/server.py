@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
 
 try:
     from fastmcp import FastMCP as _FastMCP
 except ImportError:
     class _FastMCP:  # pragma: no cover - exercised indirectly in tests
-        def __init__(self, name: str) -> None:
+        def __init__(self, name: str, **_options: Any) -> None:
             self.name = name
             self.tools: dict[str, Callable[..., Any]] = {}
 
@@ -26,14 +27,31 @@ except ImportError:
 
 
 from .tools import compile as compile_tools
-from .tools import context, generate, orchestrator, preview, surface, test as test_tools, validate
+from .tools import generate, orchestrator, preview, surface, test as test_tools, validate
 
 FastMCP = _FastMCP
 
 
+def llm_tools_enabled() -> bool:
+    """The LLM-adapter tools (autofix, patch proposal, image-to-spec) need an API provider; host-Claude setups have none.
+
+    ``UESPEC_LLM_TOOLS=on|off`` forces it; the default ``auto`` registers them only when ``UESPEC_LLM_PROVIDER`` or an
+    ``ANTHROPIC_API_KEY`` / ``OPENAI_API_KEY`` is present, which keeps ``tools/list`` small for the routed host-Claude child.
+    """
+    mode = os.getenv("UESPEC_LLM_TOOLS", "auto").strip().lower()
+    if mode in {"on", "1", "true", "yes"}:
+        return True
+    if mode in {"off", "0", "false", "no"}:
+        return False
+    return bool(os.getenv("UESPEC_LLM_PROVIDER") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENAI_API_KEY"))
+
+
 def build_server() -> FastMCP:
-    mcp = FastMCP("uespec")
-    for module in (surface, validate, compile_tools, test_tools, preview, context, orchestrator, generate):
+    mcp = FastMCP("uespec", include_fastmcp_meta=False)
+    modules = [surface, validate, compile_tools, test_tools, preview]
+    if llm_tools_enabled():
+        modules += [orchestrator, generate]
+    for module in modules:
         module.register(mcp)
     _ensure_tools_attribute(mcp)
     return mcp

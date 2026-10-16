@@ -1,60 +1,86 @@
+"""Path resolution shared by every tool.
+
+There is deliberately NO process-global "active spec": one routed backend child serves every Claude session, so a
+session-scoped default would leak between clients (WI-1586 t420). Every tool takes an explicit ``spec_path`` (a string or
+an array of strings), resolved here on the machine that executes the tool.
+"""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+from ..bridge import BridgeConfig
 
 
-_ACTIVE_SPEC: str | None = None
+def project_root() -> Path | None:
+    """The configured project root (UESPEC_PROJECT_ROOT / UESPEC_UPROJECT_PATH / uespec.hf.json), or None."""
+    try:
+        return BridgeConfig.from_env().resolved_project_root()
+    except Exception:  # noqa: BLE001 - config trouble must never break path resolution
+        return None
 
 
-def set_active_spec(spec_path: str) -> dict[str, Any]:
-    global _ACTIVE_SPEC
-    resolved = Path(spec_path).expanduser().resolve()
-    if not resolved.is_file():
-        return {
-            "ok": False,
-            "errors": [
-                {
-                    "code": "SPEC_NOT_FOUND",
-                    "path": "$.spec_path",
-                    "message": f"Spec file '{resolved}' does not exist.",
-                    "hint": "Pass an existing JSON spec path.",
-                    "nearestDeclared": [],
-                }
-            ],
-        }
-    previous = _ACTIVE_SPEC
-    _ACTIVE_SPEC = str(resolved)
-    return {"ok": True, "activeSpec": _ACTIVE_SPEC, "previousActiveSpec": previous}
+def path_list(value: str | Iterable[str] | None) -> list[str]:
+    """Normalize a ``str | list[str] | None`` tool argument into a list of non-empty strings."""
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        text = str(value).strip()
+        return [text] if text else []
+    return [text for text in (str(item).strip() for item in value) if text]
 
 
-def get_active_spec() -> str | None:
-    return _ACTIVE_SPEC
+def expand_path(candidate: str) -> Path:
+    path = Path(candidate).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    root = project_root()
+    options = [root / path] if root is not None else []
+    options.append(Path.cwd() / path)
+    for option in options:
+        if option.exists():
+            return option.resolve()
+    return options[0].resolve()
 
 
 def resolve_spec_path(spec_path: str | None, *, must_exist: bool = True) -> Path:
-    candidate = spec_path or _ACTIVE_SPEC
-    if not candidate:
-        raise ValueError("No spec path was provided and no active spec is set.")
-    resolved = Path(candidate).expanduser().resolve()
+    if not spec_path or not str(spec_path).strip():
+        raise ValueError("spec_path is required: pass an explicit spec file path (there is no active spec).")
+    resolved = expand_path(str(spec_path).strip())
     if must_exist and not resolved.is_file():
         raise FileNotFoundError(f"Spec file '{resolved}' does not exist.")
     return resolved
 
 
+def resolve_spec_paths(spec_path: str | Iterable[str] | None, *, must_exist: bool = True) -> list[Path]:
+    """Resolve one path or an array of paths; the first bad entry raises (ValueError / FileNotFoundError)."""
+    items = path_list(spec_path)
+    if not items:
+        raise ValueError("spec_path is required: pass an explicit spec file path or an array of paths.")
+    return [resolve_spec_path(item, must_exist=must_exist) for item in items]
+
+
 def resolve_base_dir(base_dir: str | None) -> Path:
     if base_dir:
-        resolved = Path(base_dir).expanduser().resolve()
+        resolved = expand_path(base_dir)
         if not resolved.exists():
             raise FileNotFoundError(f"Base directory '{resolved}' does not exist.")
         if not resolved.is_dir():
             raise NotADirectoryError(f"Base directory '{resolved}' is not a directory.")
         return resolved
-    if _ACTIVE_SPEC:
-        return Path(_ACTIVE_SPEC).parent
+    root = project_root()
+    if root is not None:
+        specs_dir = root / "UESpec"
+        if specs_dir.is_dir():
+            return specs_dir.resolve()
+        if root.is_dir():
+            return root.resolve()
     return Path.cwd()
 
 
-def register(mcp: Any) -> None:
-    mcp.tool(name="set_active_spec", description="Set the session-scoped active UISpec path.")(set_active_spec)
-    mcp.tool(name="get_active_spec", description="Return the current session-scoped active UISpec path.")(get_active_spec)
+def path_error(exc: Exception, *, path: str = "$.spec_path") -> dict[str, Any]:
+    """Structured error for a spec path that was missing (SPEC_PATH_REQUIRED) or not on disk (SPEC_NOT_FOUND)."""
+    from ..bridge import structured_error
+
+    code = "SPEC_PATH_REQUIRED" if isinstance(exc, ValueError) else "SPEC_NOT_FOUND"
+    return structured_error(code, str(exc), path=path, hint="Pass spec_path explicitly (a string, or an array of strings).")

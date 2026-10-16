@@ -107,20 +107,23 @@ The orchestrator keeps every patch attempt under `Saved/UESpec/PatchHistory` by 
 
 ## Tools
 
-- `get_support_surface`
+There is no session or "active spec" state: one backend process serves every client, so every tool takes an explicit
+`spec_path` (a string, or an array of strings for `compile_spec_to_wbp`, `run_test_spec`, `preview_spec`; relative paths
+resolve against the project root on the machine running the backend). `artifacts[]` entries are package paths for assets
+and absolute paths for files. Replies from the artifact-returning tools stay under ~2 KB (the full reply is written to
+`<project>/Saved/UESpec/artifacts/` and listed as `fullResult`).
+
+- `get_support_surface` (cached under `<project>/Saved/UESpec/cache/surface-<hash>.json`, keyed by project, engine `Build.version`, UESpec plugin HEAD/uplugin hash and HF_UISpec uplugin hash; replies carry `cache: hit|miss|off`; `force: true` re-reads it)
+- `get_component_catalog` (compact widget/converter/token/signal names from the cached surface)
+- `get_schema` (UISpec schema outline or one `$defs` section; reference material kept out of `tools/list`)
 - `validate_spec`
 - `compile_spec_to_wbp`
 - `run_test_spec`
 - `get_failure_report`
 - `list_existing_specs`
-- `preview_spec` (live editor only: compile, then offscreen render through VibeUE `capture_preview_state`; PIE is driven by `ue_driver.py`/HF tools, not the backend; `UESPEC_IMG_CHECK` enables the image verdict, `UESPEC_EPIC_URL` overrides the `:8000` fallback)
-- `set_active_spec`
-- `get_active_spec`
+- `preview_spec` (live editor only: compile, then offscreen render through VibeUE `capture_preview_state`; PIE is driven by `ue_driver.py`/HF tools, not the backend; `UESPEC_IMG_CHECK` enables the image verdict, `UESPEC_EPIC_URL` overrides the `:8000` fallback; a blank first capture is retried once)
 - `suggest_nearest`
-- `propose_patch_from_failure`
-- `run_with_autofix`
-- `generate_spec_from_image`
-- `generate_spec_from_image_with_autofix`
+- LLM-adapter tools, registered only when a provider is configured (`UESPEC_LLM_PROVIDER`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`; force with `UESPEC_LLM_TOOLS=on|off`): `propose_patch_from_failure`, `run_with_autofix`, `generate_spec_from_image`, `generate_spec_from_image_with_autofix`
 
 ## Environment
 

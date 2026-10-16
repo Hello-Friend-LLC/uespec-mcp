@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
-from . import context
+from . import _envelope, context
+from ._register import add_tool
 
 
 def _default_output_report_path(spec_path: Path) -> Path:
@@ -17,32 +18,45 @@ def _default_failure_report_path(spec_path: Path) -> Path:
 
 
 def run_test_spec(
-    spec_path: str | None = None,
+    spec_path: str | list[str],
     output_report: str | None = None,
     failure_report_path: str | None = None,
 ) -> dict[str, Any]:
+    if isinstance(spec_path, (list, tuple)):
+        items = context.path_list(spec_path)
+        if len(items) > 1 and (output_report or failure_report_path):
+            return {
+                "ok": False,
+                "summary": {},
+                "errors": [
+                    structured_error(
+                        "PATH_ARRAY_CONFLICT",
+                        "output_report/failure_report_path name one file; they cannot be combined with several spec paths.",
+                        path="$.spec_path",
+                        hint="Omit output_report and failure_report_path to get per-spec defaults under Saved/UESpec/TestReports.",
+                    )
+                ],
+            }
+        return _envelope.aggregate(
+            "run_test_spec", items, [_run_one(item, output_report, failure_report_path) for item in items]
+        )
+    return _run_one(spec_path, output_report, failure_report_path)
+
+
+def _run_one(spec_path: str | None, output_report: str | None, failure_report_path: str | None) -> dict[str, Any]:
     try:
         resolved_spec = context.resolve_spec_path(spec_path)
     except (FileNotFoundError, ValueError) as exc:
-        code = "ACTIVE_SPEC_REQUIRED" if isinstance(exc, ValueError) else "SPEC_NOT_FOUND"
         return {
             "ok": False,
+            "specPath": spec_path,
             "summary": {},
-            "errors": [
-                structured_error(
-                    code,
-                    str(exc),
-                    path="$.spec_path",
-                    hint="Pass spec_path explicitly or call set_active_spec first.",
-                )
-            ],
+            "errors": [context.path_error(exc)],
         }
 
-    resolved_report = Path(output_report).expanduser().resolve() if output_report else _default_output_report_path(resolved_spec)
+    resolved_report = context.expand_path(output_report) if output_report else _default_output_report_path(resolved_spec)
     resolved_failure_report = (
-        Path(failure_report_path).expanduser().resolve()
-        if failure_report_path
-        else _default_failure_report_path(resolved_spec)
+        context.expand_path(failure_report_path) if failure_report_path else _default_failure_report_path(resolved_spec)
     )
 
     try:
@@ -67,7 +81,7 @@ def run_test_spec(
 
 
 def get_failure_report(report_path: str) -> dict[str, Any]:
-    resolved_report = Path(report_path).expanduser().resolve()
+    resolved_report = context.expand_path(report_path)
     if not resolved_report.is_file():
         return {
             "ok": False,
@@ -107,5 +121,16 @@ def get_failure_report(report_path: str) -> dict[str, Any]:
 
 
 def register(mcp: Any) -> None:
-    mcp.tool(name="run_test_spec", description="Run a UISpec test document and return a report path plus summary.")(run_test_spec)
-    mcp.tool(name="get_failure_report", description="Read a UESpec failure-report.json file and return its parsed payload.")(get_failure_report)
+    add_tool(
+        mcp,
+        "run_test_spec",
+        "Run UISpec test document(s). spec_path is a path or an array of paths. Returns a summary plus absolute JUnit and failure-report paths in artifacts[].",
+        run_test_spec,
+        compact=True,
+    )
+    add_tool(
+        mcp,
+        "get_failure_report",
+        "Read a *.failure-report.json file and return its parsed payload.",
+        get_failure_report,
+    )

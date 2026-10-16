@@ -83,8 +83,8 @@ class FakeBridge:
 
 
 @pytest.fixture(autouse=True)
-def reset_surface_cache() -> None:
-    surface_tool._SUPPORT_SURFACE_CACHE = {}
+def empty_support_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(surface_tool, "_ensure_surface_json", lambda force=False: {})
 
 
 def test_orchestrator_fixes_compile_error_in_one_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -108,11 +108,6 @@ def test_orchestrator_fixes_compile_error_in_one_attempt(tmp_path: Path, monkeyp
         orchestrator_tools.context,
         "resolve_spec_path",
         lambda spec_path_value, must_exist=True: Path(spec_path_value).expanduser().resolve(),
-    )
-    monkeypatch.setattr(
-        orchestrator_tools.context,
-        "get_active_spec",
-        lambda: None,
     )
 
     def fake_validate(spec_content: str) -> dict[str, Any]:
@@ -503,6 +498,7 @@ def test_orchestrator_runs_tests_against_latest_generated_asset(tmp_path: Path, 
 
 
 def test_orchestrator_tools_register_on_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UESPEC_LLM_TOOLS", "on")
     monkeypatch.setattr(orchestrator_tools.context, "resolve_spec_path", lambda value, must_exist=True: Path(value).expanduser().resolve())
     server = __import__("uespec_mcp.server", fromlist=["build_server", "list_registered_tools"])
     mcp = server.build_server()

@@ -15,6 +15,7 @@ from ..llm.prompts.templates import render
 from ..llm.types import LLMImageAttachment, LLMRequest
 from ..orchestrator.core import Orchestrator
 from . import surface, validate
+from ._register import add_tool
 
 
 _SUPPORTED_TARGET_KINDS = {"HUD", "Menu", "Popup", "Modal", "Debug", "WorldSpace", "Component"}
@@ -445,11 +446,16 @@ def _resolve_existing_file(path: str) -> Path:
 
 
 def register(mcp: Any) -> None:
-    mcp.tool(
-        name="generate_spec_from_image",
-        description="Generate a UISpec JSON document from a UI screenshot using the active support surface and example retrieval.",
-    )(generate_spec_from_image)
-    mcp.tool(
-        name="generate_spec_from_image_with_autofix",
-        description="Generate a UISpec JSON document from a UI screenshot, then run the closed-loop autofix orchestrator against a test spec.",
-    )(generate_spec_from_image_with_autofix)
+    add_tool(
+        mcp,
+        "generate_spec_from_image",
+        "Generate a UISpec JSON document from a UI screenshot (LLM adapter; uses the cached support surface and example retrieval).",
+        generate_spec_from_image,
+    )
+    add_tool(
+        mcp,
+        "generate_spec_from_image_with_autofix",
+        "Generate a UISpec from a UI screenshot, then run the autofix orchestrator against a test spec.",
+        generate_spec_from_image_with_autofix,
+        compact=True,
+    )

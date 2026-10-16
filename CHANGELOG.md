@@ -5,6 +5,13 @@ versioned public release yet, so entries are grouped by development round.
 
 ## Unreleased - prerelease cleanup
 
+- HF (WI-1586 t420): compact, cached, session-safe discovery. Removed the process-global active spec
+  (`set_active_spec` / `get_active_spec`; every tool takes an explicit `spec_path`, error `SPEC_PATH_REQUIRED`);
+  `compile_spec_to_wbp` / `run_test_spec` / `preview_spec` accept arrays of spec paths and `artifacts[]` file paths are
+  absolute; the support surface is cached per project/engine/plugin build (`cache: hit|miss`, `force`); added
+  `get_component_catalog` and `get_schema`; one-paragraph tool descriptions, no outputSchema, LLM-adapter tools only
+  registered when a provider is configured; artifact tool replies are capped at ~2 KB.
+
 - HF (WI-1586 t211): `validate_spec` rejects indexed/call bind paths with `UNSUPPORTED_BINDING_PATH` and
   returns `UNSUPPORTED_KEY` warnings for schema keys marked `x-status: unsupported`; `MockBridge` mirrors the
   UESpec plugin converters, signals, action event/primitive status and binding/action error codes.

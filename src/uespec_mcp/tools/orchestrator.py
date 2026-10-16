@@ -8,6 +8,7 @@ from ..llm.base import LLMConfigurationError
 from ..llm.factory import create_llm_client
 from ..orchestrator.core import Orchestrator, load_primary_failure, propose_patch_from_failure as propose_patch_from_failure_core
 from . import context, test as test_tools
+from ._register import add_tool
 
 
 def propose_patch_from_failure(
@@ -22,18 +23,7 @@ def propose_patch_from_failure(
     try:
         resolved_spec = context.resolve_spec_path(spec_path)
     except (FileNotFoundError, ValueError) as exc:
-        code = "ACTIVE_SPEC_REQUIRED" if isinstance(exc, ValueError) else "SPEC_NOT_FOUND"
-        return {
-            "ok": False,
-            "errors": [
-                structured_error(
-                    code,
-                    str(exc),
-                    path="$.spec_path",
-                    hint="Pass spec_path explicitly or call set_active_spec first.",
-                )
-            ],
-        }
+        return {"ok": False, "errors": [context.path_error(exc)]}
 
     failure_report_result = test_tools.get_failure_report(failure_report_path)
     if not failure_report_result.get("ok"):
@@ -92,18 +82,7 @@ def run_with_autofix(
         resolved_spec = context.resolve_spec_path(spec_path)
         resolved_test_spec = context.resolve_spec_path(test_spec_path)
     except (FileNotFoundError, ValueError) as exc:
-        code = "ACTIVE_SPEC_REQUIRED" if isinstance(exc, ValueError) else "SPEC_NOT_FOUND"
-        return {
-            "ok": False,
-            "errors": [
-                structured_error(
-                    code,
-                    str(exc),
-                    path="$.spec_path",
-                    hint="Pass existing spec paths explicitly or call set_active_spec first.",
-                )
-            ],
-        }
+        return {"ok": False, "errors": [context.path_error(exc)]}
 
     try:
         orchestrator = Orchestrator(
@@ -126,5 +105,5 @@ def run_with_autofix(
 
 
 def register(mcp: Any) -> None:
-    mcp.tool(name="propose_patch_from_failure", description="Propose a JSON Patch from a UESpec failure report using the configured LLM adapter.")(propose_patch_from_failure)
-    mcp.tool(name="run_with_autofix", description="Run the UESpec closed-loop autofix orchestrator against a spec and test spec.")(run_with_autofix)
+    add_tool(mcp, "propose_patch_from_failure", "Propose a JSON Patch for a spec from a failure report, using the configured LLM adapter.", propose_patch_from_failure)
+    add_tool(mcp, "run_with_autofix", "Run the closed-loop autofix orchestrator (LLM adapter) against a spec and its test spec.", run_with_autofix, compact=True)

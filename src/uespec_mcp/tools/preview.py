@@ -4,24 +4,39 @@ import uuid
 from typing import Any
 
 from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
-from . import context
+from . import _envelope, context
+from ._register import add_tool
 
 PREVIEW_DESCRIPTION = (
-    "Compile a UISpec JSON file into a Widget Blueprint in the live editor, then render it offscreen through VibeUE "
-    "capture_preview_state (no PIE) and return the PNG path under Saved/WidgetPreviews plus an image verdict "
-    "(set UESPEC_IMG_CHECK to an img_check.py-compatible command to enable it; otherwise imageVerdict is 'unchecked'). "
-    "A blank first capture (cold asset load) is retried once. Pass asset_path to preview an existing asset without compiling. "
-    "PIE is NOT driven by this backend: start/stop PIE and runtime captures with ue_driver.py or the HF editor tools."
+    "Compile UISpec JSON file(s) in the live editor and render each offscreen (no PIE) through VibeUE capture_preview_state; "
+    "returns the absolute PNG path in artifacts[] plus an image verdict. spec_path is a path or an array; "
+    "pass asset_path instead to preview an existing asset without compiling. PIE is NOT driven by this backend."
 )
 
 
 def preview_spec(
-    spec_path: str | None = None,
+    spec_path: str | list[str] | None = None,
     output_dir: str | None = None,
     asset_path: str | None = None,
     width: int = 1280,
     height: int = 720,
     state: str = "normal",
+) -> dict[str, Any]:
+    if isinstance(spec_path, (list, tuple)) and not asset_path:
+        items = context.path_list(spec_path)
+        return _envelope.aggregate(
+            "preview_spec", items, [_preview_one(item, output_dir, None, width, height, state) for item in items]
+        )
+    return _preview_one(spec_path if isinstance(spec_path, str) else None, output_dir, asset_path, width, height, state)
+
+
+def _preview_one(
+    spec_path: str | None,
+    output_dir: str | None,
+    asset_path: str | None,
+    width: int,
+    height: int,
+    state: str,
 ) -> dict[str, Any]:
     bridge = get_bridge()
     unavailable = getattr(bridge, "preview_unavailable_code", None)
@@ -50,11 +65,11 @@ def preview_spec(
         try:
             resolved_spec = context.resolve_spec_path(spec_path)
         except (FileNotFoundError, ValueError) as exc:
-            code = "ACTIVE_SPEC_REQUIRED" if isinstance(exc, ValueError) else "SPEC_NOT_FOUND"
             return {
                 "ok": False,
+                "specPath": spec_path,
                 "artifacts": [],
-                "errors": [structured_error(code, str(exc), path="$.spec_path", hint="Pass spec_path (or asset_path) explicitly.")],
+                "errors": [context.path_error(exc)],
             }
         default_output_dir = getattr(getattr(bridge, "config", None), "output_dir", None) or "/Game/UESpec/Generated"
         resolved_output_dir = output_dir.strip() if output_dir else default_output_dir
@@ -120,4 +135,4 @@ def preview_spec(
 
 
 def register(mcp: Any) -> None:
-    mcp.tool(name="preview_spec", description=PREVIEW_DESCRIPTION)(preview_spec)
+    add_tool(mcp, "preview_spec", PREVIEW_DESCRIPTION, preview_spec, compact=True)

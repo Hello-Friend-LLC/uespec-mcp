@@ -1,21 +1,29 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from ..bridge import BridgeError, bridge_error_fields, get_bridge, structured_error
-from . import context
+from . import _envelope, context
+from ._register import add_tool
 
 
-def compile_spec_to_wbp(spec_path: str | None = None, output_dir: str | None = None) -> dict[str, Any]:
+def compile_spec_to_wbp(spec_path: str | list[str], output_dir: str | None = None) -> dict[str, Any]:
+    items = context.path_list(spec_path)
+    if isinstance(spec_path, (list, tuple)):
+        return _envelope.aggregate("compile_spec_to_wbp", items, [_compile_one(item, output_dir) for item in items])
+    return _compile_one(spec_path, output_dir)
+
+
+def _compile_one(spec_path: str | None, output_dir: str | None) -> dict[str, Any]:
     try:
         resolved_spec = context.resolve_spec_path(spec_path)
     except (FileNotFoundError, ValueError) as exc:
         return {
             "ok": False,
+            "specPath": spec_path,
             "generatedAssets": [],
-            "errors": [_path_resolution_error(exc)],
+            "errors": [context.path_error(exc)],
         }
 
     bridge = get_bridge()
@@ -59,7 +67,6 @@ def list_existing_specs(base_dir: str | None = None) -> dict[str, Any]:
             ],
         }
 
-    active_spec = context.get_active_spec()
     items: list[dict[str, Any]] = []
     for path in sorted(search_root.rglob("*.json")):
         try:
@@ -76,24 +83,23 @@ def list_existing_specs(base_dir: str | None = None) -> dict[str, Any]:
                 "kind": payload.get("kind"),
                 "path": str(path.resolve()),
                 "description": payload.get("description", ""),
-                "active": str(path.resolve()) == active_spec,
             }
         )
 
     return {"ok": True, "baseDir": str(search_root), "count": len(items), "items": items}
 
 
-def _path_resolution_error(exc: Exception) -> dict[str, Any]:
-    message = str(exc)
-    code = "ACTIVE_SPEC_REQUIRED" if isinstance(exc, ValueError) else "SPEC_NOT_FOUND"
-    return structured_error(
-        code,
-        message,
-        path="$.spec_path",
-        hint="Pass spec_path explicitly or call set_active_spec first.",
-    )
-
-
 def register(mcp: Any) -> None:
-    mcp.tool(name="compile_spec_to_wbp", description="Compile a UISpec JSON file into a Widget Blueprint asset. output_dir must be an Unreal package path such as /Game/UESpec/Generated.")(compile_spec_to_wbp)
-    mcp.tool(name="list_existing_specs", description="List existing UISpec JSON files on disk.")(list_existing_specs)
+    add_tool(
+        mcp,
+        "compile_spec_to_wbp",
+        "Compile UISpec JSON file(s) into Widget Blueprint assets. spec_path is a path or an array of paths; output_dir is an Unreal package path (default /Game/UESpec/Generated). Returns asset paths and absolute artifacts[].",
+        compile_spec_to_wbp,
+        compact=True,
+    )
+    add_tool(
+        mcp,
+        "list_existing_specs",
+        "List UISpec JSON files under base_dir (default: the project's UESpec folder).",
+        list_existing_specs,
+    )

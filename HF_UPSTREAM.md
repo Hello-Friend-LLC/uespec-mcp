@@ -20,3 +20,6 @@ HF patches (WI-1586 t211): schema `x-status` markers + indexed-bind rejection, `
 Update procedure: `git remote add upstream https://github.com/Mithril0rd/uespec-mcp-public.git`,
 fetch, merge `upstream/main` into `hf-main`, push, re-run `pytest -q`. Keep local patches as
 minimal, upstream-PR-shaped commits.
+
+HF patches (WI-1586 t420): removed the global active spec, array `spec_path`, absolute `artifacts[]`, on-disk surface cache
+(`surface_cache.py`), `get_component_catalog` / `get_schema`, compact `tools/list`, compact artifact replies (`tools/_envelope.py`).
